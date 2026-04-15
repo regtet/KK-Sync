@@ -326,7 +326,7 @@ ipcMain.handle('sync:start', async (_, payload) => {
     return { ok: true, results, cancelled };
     } catch (error) {
         const message = error?.message ?? String(error);
-        relayLog({ message, level: 'error', timestamp: new Date().toISOString() });
+        relayLog({ message, level: 'error', timestamp: new Date().toISOString(), repoIndex });
         withLogRelay('sync:status')({ status: 'failed', mode, repoIndex, message });
         return { ok: false, error: message };
     }

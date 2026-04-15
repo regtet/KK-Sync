@@ -51,14 +51,14 @@
       </div>
 
       <section class="card log-card">
-        <log-view :logs="logs" :syncing="syncingState[1] || syncingState[2]" @clear="clearLogs" />
+        <log-view :logs="activeLogs" :syncing="!!syncingState[activeTab]" @clear="clearLogs" />
       </section>
     </main>
   </div>
 </template>
 
 <script setup>
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import RepoQueuePanel from './components/RepoQueuePanel.vue';
 import LogView from './components/LogView.vue';
 import appLogo from '../assets/img/logo.png';
@@ -69,7 +69,7 @@ const themes = [
 ];
 
 const activeTab = ref(1);
-const logs = ref([]);
+const logsByRepo = ref({ 1: [], 2: [] });
 const syncingState = ref({ 1: false, 2: false });
 const panel1Ref = ref(null);
 const panel2Ref = ref(null);
@@ -119,12 +119,27 @@ const resolveModeLabel = (mode) => {
 let disposeLogListener = null;
 let disposeStatusListener = null;
 
-const appendLog = (log) => {
-  logs.value.push(log);
-  // 防止长时间运行日志无限增长导致渲染卡顿
-  if (logs.value.length > 1200) {
-    logs.value = logs.value.slice(-1000);
+const detectRepoIndex = (log) => {
+  if (log?.repoIndex === 1 || log?.repoIndex === 2) {
+    return log.repoIndex;
   }
+  const text = typeof log?.message === 'string' ? log.message : '';
+  const match = text.match(/\[仓库([12])\]/);
+  if (match) {
+    return Number(match[1]);
+  }
+  return activeTab.value;
+};
+
+const appendLog = (log) => {
+  const repoIndex = detectRepoIndex(log);
+  const currentLogs = logsByRepo.value[repoIndex] ?? [];
+  const nextLogs = [...currentLogs, { ...log, repoIndex }];
+  // 防止长时间运行日志无限增长导致渲染卡顿
+  logsByRepo.value = {
+    ...logsByRepo.value,
+    [repoIndex]: nextLogs.length > 1200 ? nextLogs.slice(-1000) : nextLogs
+  };
 };
 
 const handleNotify = ({ type, message }) => pushNotification(type, message);
@@ -133,8 +148,13 @@ const handleSyncChange = ({ repoIndex, syncing }) => {
 };
 
 const clearLogs = () => {
-  logs.value = [];
+  logsByRepo.value = {
+    ...logsByRepo.value,
+    [activeTab.value]: []
+  };
 };
+
+const activeLogs = computed(() => logsByRepo.value[activeTab.value] ?? []);
 
 const summarizeResults = (results, modeLabel, repoIndex) => {
   if (!Array.isArray(results) || results.length === 0) {
@@ -387,11 +407,12 @@ onBeforeUnmount(() => {
 
 .content {
   flex: 1;
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: minmax(0, 1.7fr) minmax(360px, 1fr);
   gap: 24px;
   padding: 24px 80px;
   overflow: hidden;
+  align-items: stretch;
 }
 
 .card {
@@ -402,7 +423,6 @@ onBeforeUnmount(() => {
 }
 
 .panel-area {
-  flex: 1;
   min-height: 0;
   overflow: auto;
   scrollbar-width: none;
@@ -414,15 +434,24 @@ onBeforeUnmount(() => {
 }
 
 .log-card {
-  height: 220px;
-  max-width: 1200px;
-  width: 100%;
-  margin: 0 auto;
+  min-width: 0;
+  height: 100%;
 }
 
 .log-card :deep(.log-view) {
-  flex: 1;
+  height: 100%;
   min-height: 0;
+}
+
+@media (max-width: 1400px) {
+  .content {
+    grid-template-columns: 1fr;
+    overflow: auto;
+  }
+
+  .log-card {
+    min-height: 280px;
+  }
 }
 
 .tabs {

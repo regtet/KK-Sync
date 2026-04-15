@@ -242,7 +242,8 @@ class GitService extends EventEmitter {
             this.emit('log', {
                 message: `仓库${repoIndex} 收到中止请求，正在尝试停止当前同步任务`,
                 level: 'warn',
-                timestamp: new Date().toISOString()
+                timestamp: new Date().toISOString(),
+                repoIndex
             });
         }
         return true;
@@ -282,7 +283,8 @@ class GitService extends EventEmitter {
                 const payload = {
                     message: `[仓库${repoIndex}] ${message}`,
                     level,
-                    timestamp: new Date().toISOString()
+                    timestamp: new Date().toISOString(),
+                    repoIndex
                 };
                 if (typeof onLog === 'function') {
                     onLog(payload);
