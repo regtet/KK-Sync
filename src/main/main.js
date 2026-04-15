@@ -1,6 +1,7 @@
-import { app, BrowserWindow, ipcMain, dialog } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { gitService } from './gitService.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -10,6 +11,77 @@ const __dirname = path.dirname(__filename);
 const isDev = !app.isPackaged;
 
 let mainWindow = null;
+let tray = null;
+let isQuitting = false;
+const repoPathStoreFile = path.join(app.getPath('userData'), 'last-repo-paths.json');
+
+const readLastRepoPaths = () => {
+    try {
+        if (!existsSync(repoPathStoreFile)) return {};
+        const text = readFileSync(repoPathStoreFile, 'utf-8');
+        const data = JSON.parse(text);
+        return typeof data === 'object' && data ? data : {};
+    } catch {
+        return {};
+    }
+};
+
+const writeLastRepoPath = (key, value) => {
+    try {
+        const curr = readLastRepoPaths();
+        curr[key] = value;
+        writeFileSync(repoPathStoreFile, JSON.stringify(curr, null, 2), 'utf-8');
+    } catch {
+        // ignore persistence failure
+    }
+};
+
+const resolveTrayIcon = () => {
+    const iconCandidates = [
+        path.join(__dirname, '../../image.png'),
+        path.join(process.cwd(), 'image.png')
+    ];
+    const iconPath = iconCandidates.find((p) => existsSync(p));
+    if (iconPath) {
+        return nativeImage.createFromPath(iconPath);
+    }
+    return nativeImage.createEmpty();
+};
+
+const showMainWindow = () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (!mainWindow.isVisible()) {
+        mainWindow.show();
+    }
+    if (mainWindow.isMinimized()) {
+        mainWindow.restore();
+    }
+    mainWindow.focus();
+};
+
+const createTray = () => {
+    if (tray) return;
+    tray = new Tray(resolveTrayIcon());
+    tray.setToolTip('KK Sync');
+    const trayMenu = Menu.buildFromTemplate([
+        {
+            label: '显示窗口',
+            click: () => showMainWindow()
+        },
+        {
+            type: 'separator'
+        },
+        {
+            label: '退出程序',
+            click: () => {
+                isQuitting = true;
+                app.quit();
+            }
+        }
+    ]);
+    tray.setContextMenu(trayMenu);
+    tray.on('double-click', () => showMainWindow());
+};
 
 const withLogRelay = (channel) => (payload) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -25,6 +97,7 @@ async function createWindow() {
         minHeight: 900,
         backgroundColor: '#1f1f1f',
         show: false,
+        autoHideMenuBar: true,
         webPreferences: {
             preload: path.join(__dirname, '../preload.cjs'),
             nodeIntegration: false,
@@ -41,6 +114,8 @@ async function createWindow() {
         const rendererIndex = path.join(__dirname, '../../dist/renderer/index.html');
         await mainWindow.loadFile(rendererIndex);
     }
+    mainWindow.setMenuBarVisibility(false);
+    mainWindow.setMenu(null);
 
     mainWindow.once('ready-to-show', () => {
         mainWindow?.show();
@@ -49,22 +124,38 @@ async function createWindow() {
     mainWindow.on('closed', () => {
         mainWindow = null;
     });
+
+    mainWindow.on('close', (event) => {
+        // 点击右上角关闭时默认隐藏到托盘，不直接退出
+        if (!isQuitting) {
+            event.preventDefault();
+            mainWindow.hide();
+        }
+    });
 }
 
 app.whenReady().then(() => {
+    Menu.setApplicationMenu(null);
+    createTray();
     createWindow();
 
     app.on('activate', () => {
         if (BrowserWindow.getAllWindows().length === 0) {
             createWindow();
+        } else {
+            showMainWindow();
         }
     });
 });
 
 app.on('window-all-closed', () => {
-    if (process.platform !== 'darwin') {
+    if (process.platform !== 'darwin' && isQuitting) {
         app.quit();
     }
+});
+
+app.on('before-quit', () => {
+    isQuitting = true;
 });
 
 const relayLog = withLogRelay('sync:log');
@@ -72,8 +163,10 @@ const relayLog = withLogRelay('sync:log');
 gitService.on('log', relayLog);
 
 ipcMain.handle('repo:select', async () => {
+    const lastPaths = readLastRepoPaths();
     const result = await dialog.showOpenDialog(mainWindow, {
-        properties: ['openDirectory']
+        properties: ['openDirectory'],
+        defaultPath: lastPaths.repo1
     });
 
     if (result.canceled || result.filePaths.length === 0) {
@@ -83,7 +176,8 @@ ipcMain.handle('repo:select', async () => {
     const repoPath = result.filePaths[0];
     try {
         const info = await gitService.setRepository(repoPath);
-        const branches = await gitService.getBranches();
+        const branches = await gitService.getBranches(1);
+        writeLastRepoPath('repo1', repoPath);
         return {
             canceled: false,
             repo: info,
@@ -97,36 +191,83 @@ ipcMain.handle('repo:select', async () => {
     }
 });
 
-ipcMain.handle('repo:info', async () => {
+ipcMain.handle('repo:select2', async () => {
+    const lastPaths = readLastRepoPaths();
+    const result = await dialog.showOpenDialog(mainWindow, {
+        properties: ['openDirectory'],
+        defaultPath: lastPaths.repo2
+    });
+
+    if (result.canceled || result.filePaths.length === 0) {
+        return { canceled: true };
+    }
+
+    const repoPath = result.filePaths[0];
     try {
-        const info = await gitService.getRepositoryInfo();
+        const info = await gitService.setRepository2(repoPath);
+        const branches = await gitService.getBranches(2);
+        writeLastRepoPath('repo2', repoPath);
+        return {
+            canceled: false,
+            repo: info,
+            branches
+        };
+    } catch (error) {
+        return {
+            canceled: false,
+            error: error?.message ?? String(error)
+        };
+    }
+});
+
+ipcMain.handle('repo:clear2', async () => {
+    try {
+        await gitService.setRepository2(null);
+        return { ok: true };
+    } catch (error) {
+        return { ok: false, error: error?.message ?? String(error) };
+    }
+});
+
+ipcMain.handle('repo:has', async (_, repoIndex = 1) => {
+    return { ok: true, hasRepo: gitService.hasRepository(repoIndex) };
+});
+
+ipcMain.handle('repo:info', async (_, repoIndex = 1) => {
+    try {
+        const info = await gitService.getRepositoryInfo(repoIndex);
         return { ok: true, data: info };
     } catch (error) {
         return { ok: false, error: error?.message ?? String(error) };
     }
 });
 
-ipcMain.handle('repo:list-branches', async () => {
+ipcMain.handle('repo:list-branches', async (_, repoIndex = 1) => {
     try {
-        const branches = await gitService.getBranches();
+        const branches = await gitService.getBranches(repoIndex);
         return { ok: true, data: branches };
     } catch (error) {
         return { ok: false, error: error?.message ?? String(error) };
     }
 });
 
-ipcMain.handle('repo:list-stash', async () => {
+ipcMain.handle('repo:list-stash', async (_, repoIndex = 1) => {
     try {
-        const stash = await gitService.getStashList();
+        const stash = await gitService.getStashList(repoIndex);
         return { ok: true, data: stash };
     } catch (error) {
         return { ok: false, error: error?.message ?? String(error) };
     }
 });
 
-ipcMain.handle('repo:check-remote-branches', async (_, branchNames) => {
+ipcMain.handle('repo:check-remote-branches', async (_, payload) => {
     try {
-        const result = await gitService.checkRemoteBranches(branchNames);
+        const branchNames = Array.isArray(payload) ? payload : payload?.branchNames;
+        const repoIndex =
+            typeof payload === 'object' && payload && !Array.isArray(payload)
+                ? payload.repoIndex ?? 1
+                : 1;
+        const result = await gitService.checkRemoteBranches(branchNames ?? [], repoIndex);
         return { ok: true, data: result };
     } catch (error) {
         return { ok: false, error: error?.message ?? String(error) };
@@ -154,29 +295,30 @@ ipcMain.handle('patch:select', async () => {
 });
 
 ipcMain.handle('sync:start', async (_, payload) => {
-    const { mode = 'branch' } = payload ?? {};
+    const { mode = 'commit', repoIndex = 1 } = payload ?? {};
     try {
-    withLogRelay('sync:status')({ status: 'running', mode });
-    const { results, cancelled } = await gitService.syncBranches(payload, relayLog);
+    withLogRelay('sync:status')({ status: 'running', mode, repoIndex });
+    const { results, cancelled } = await gitService.syncBranches(payload, relayLog, repoIndex);
     withLogRelay('sync:status')({
       status: cancelled ? 'cancelled' : 'completed',
       mode,
+      repoIndex,
       results
     });
     return { ok: true, results, cancelled };
     } catch (error) {
         const message = error?.message ?? String(error);
         relayLog({ message, level: 'error', timestamp: new Date().toISOString() });
-        withLogRelay('sync:status')({ status: 'failed', mode, message });
+        withLogRelay('sync:status')({ status: 'failed', mode, repoIndex, message });
         return { ok: false, error: message };
     }
 });
 
-ipcMain.handle('sync:cancel', async () => {
+ipcMain.handle('sync:cancel', async (_, repoIndex = 1) => {
   try {
-    const cancelled = gitService.cancelSync();
+    const cancelled = gitService.cancelSync(repoIndex);
     if (!cancelled) {
-      return { ok: false, error: '当前没有正在进行的同步任务' };
+      return { ok: false, error: `仓库${repoIndex} 当前没有正在进行的同步任务` };
     }
     return { ok: true };
   } catch (error) {

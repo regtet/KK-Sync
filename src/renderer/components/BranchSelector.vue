@@ -3,13 +3,13 @@
     <header>
       <h2>分支选择</h2>
     </header>
-    <section v-if="branches.list.length" class="fields">
+    <section v-if="branchList.length" class="fields">
       <div v-if="!props.hideSource" class="field">
         <label for="source-branch">源分支</label>
         <select id="source-branch" v-model="localSource" @change="onSourceChange">
           <option disabled value="">请选择源分支</option>
           <option
-            v-for="branch in branches.list"
+            v-for="branch in branchList"
             :key="branch"
             :value="branch"
           >
@@ -29,10 +29,11 @@
           v-model="bulkInput"
           class="bulk-input"
           placeholder="批量粘贴分支名，每行一个，支持去除括号备注"
+          @paste="handleBulkPaste"
         ></textarea>
         <div class="bulk-actions">
-          <button type="button" class="bulk-btn" @click="applyBulkInput">
-            添加到目标分支
+          <button type="button" class="bulk-btn" :disabled="checkingRemote" @click="applyBulkInput">
+            {{ checkingRemote ? '添加中...' : '添加到目标分支' }}
           </button>
           <button type="button" class="bulk-btn secondary" @click="clearTargets">
             清空已选
@@ -80,6 +81,10 @@ const props = defineProps({
   hideSource: {
     type: Boolean,
     default: false
+  },
+  repoIndex: {
+    type: Number,
+    default: 1
   }
 });
 
@@ -90,6 +95,8 @@ const localTargets = ref([...props.targetBranches]);
 const targetSearch = ref('');
 const bulkInput = ref('');
 const bulkFeedback = ref('');
+const checkingRemote = ref(false);
+let pasteAutoAddTimer = null;
 
 const arraysEqual = (a, b) => {
   if (a.length !== b.length) return false;
@@ -125,10 +132,19 @@ watch(localTargets, (value) => {
 
 const filteredTargets = computed(() => {
   const keyword = targetSearch.value.trim().toLowerCase();
-  const base = props.branches.list;
+  const base = branchList.value;
 
   if (!keyword) {
-    return Array.from(new Set([...localTargets.value, ...base]));
+    // 大仓库分支很多时，默认只渲染已选 + 前 200 条，减少 DOM 压力避免卡顿
+    const selectedSet = new Set(localTargets.value);
+    const preview = [];
+    for (const branch of base) {
+      if (!selectedSet.has(branch)) {
+        preview.push(branch);
+      }
+      if (preview.length >= 200) break;
+    }
+    return [...localTargets.value, ...preview];
   }
 
   const matched = base.filter((branch) => branch.toLowerCase().includes(keyword));
@@ -153,7 +169,10 @@ const sanitizeBranchName = (value = '') => {
   return v.trim();
 };
 
+const branchList = computed(() => props.branches?.list ?? props.branches?.branches ?? []);
+
 const applyBulkInput = async () => {
+  if (checkingRemote.value) return;
   const entries = bulkInput.value
     .split(/\r?\n/)
     .map((line) => sanitizeBranchName(line))
@@ -166,6 +185,7 @@ const applyBulkInput = async () => {
 
   // 显示查询状态
   bulkFeedback.value = '正在查询远程分支...';
+  checkingRemote.value = true;
 
   try {
     // 查询远程分支验证分支是否存在
@@ -174,7 +194,7 @@ const applyBulkInput = async () => {
       return;
     }
 
-    const result = await window.electronAPI.checkRemoteBranches(entries);
+    const result = await window.electronAPI.checkRemoteBranches(entries, props.repoIndex);
 
     if (!result?.ok) {
       bulkFeedback.value = `查询失败：${result?.error || '未知错误'}`;
@@ -206,7 +226,17 @@ const applyBulkInput = async () => {
     }
   } catch (error) {
     bulkFeedback.value = `查询远程分支失败：${error?.message || '未知错误'}`;
+  } finally {
+    checkingRemote.value = false;
   }
+};
+
+const handleBulkPaste = () => {
+  // 粘贴场景下自动触发“添加到目标分支”，贴合“手动输入后自动添加”的使用习惯
+  if (pasteAutoAddTimer) clearTimeout(pasteAutoAddTimer);
+  pasteAutoAddTimer = setTimeout(() => {
+    applyBulkInput();
+  }, 120);
 };
 
 const clearTargets = () => {
@@ -335,15 +365,21 @@ select {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
   gap: 10px;
-  flex: 1;
-  min-height: 0;
-  max-height: 100%;
+  min-height: 160px;
+  max-height: 280px;
   padding: 12px;
   background: color-mix(in srgb, var(--surface-muted) 70%, transparent);
   border-radius: 14px;
   border: 1px dashed var(--border);
   overflow-y: auto;
   overflow-x: hidden;
+  contain: content;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.target-list::-webkit-scrollbar {
+  display: none;
 }
 
 .target-item {
