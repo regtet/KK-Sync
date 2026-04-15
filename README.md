@@ -1,4 +1,4 @@
-# Git Sync Visualizer
+# KK Sync
 
 一个基于 **Electron + Vue3 + Vite + simple-git** 打造的桌面工具，专注于在多个分支之间同步代码。通过简洁的深色界面、实时日志与多种同步策略，帮助你在多分支、多仓库场景下保持代码一致。
 

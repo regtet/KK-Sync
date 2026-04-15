@@ -14,6 +14,7 @@ let mainWindow = null;
 let tray = null;
 let isQuitting = false;
 const repoPathStoreFile = path.join(app.getPath('userData'), 'last-repo-paths.json');
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
 
 const readLastRepoPaths = () => {
     try {
@@ -39,8 +40,10 @@ const writeLastRepoPath = (key, value) => {
 const resolveTrayIcon = () => {
     const iconCandidates = [
         path.join(__dirname, '../assets/img/logo.ico'),
+        path.join(__dirname, '../assets/img/logo_ico_256x256.ico'),
         path.join(__dirname, '../assets/img/logo.png'),
         path.join(process.cwd(), 'src/assets/img/logo.ico'),
+        path.join(process.cwd(), 'src/assets/img/logo_ico_256x256.ico'),
         path.join(process.cwd(), 'src/assets/img/logo.png')
     ];
     const iconPath = iconCandidates.find((p) => existsSync(p));
@@ -121,7 +124,11 @@ async function createWindow() {
     mainWindow.setMenu(null);
 
     mainWindow.once('ready-to-show', () => {
-        mainWindow?.show();
+        showMainWindow();
+    });
+    // 某些环境可能不会稳定触发 ready-to-show，这里增加兜底确保首启可见
+    mainWindow.webContents.once('did-finish-load', () => {
+        setTimeout(() => showMainWindow(), 120);
     });
 
     mainWindow.on('closed', () => {
@@ -137,19 +144,27 @@ async function createWindow() {
     });
 }
 
-app.whenReady().then(() => {
-    Menu.setApplicationMenu(null);
-    createTray();
-    createWindow();
-
-    app.on('activate', () => {
-        if (BrowserWindow.getAllWindows().length === 0) {
-            createWindow();
-        } else {
-            showMainWindow();
-        }
+if (!gotSingleInstanceLock) {
+    app.quit();
+} else {
+    app.on('second-instance', () => {
+        showMainWindow();
     });
-});
+
+    app.whenReady().then(() => {
+        Menu.setApplicationMenu(null);
+        createTray();
+        createWindow();
+
+        app.on('activate', () => {
+            if (BrowserWindow.getAllWindows().length === 0) {
+                createWindow();
+            } else {
+                showMainWindow();
+            }
+        });
+    });
+}
 
 app.on('window-all-closed', () => {
     if (process.platform !== 'darwin' && isQuitting) {

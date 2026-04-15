@@ -1,5 +1,5 @@
 {
-    "name": "git-sync-visualizer",
+    "name": "kk-sync",
     "version": "0.1.0",
     "main": "src/main/main.js",
     "license": "MIT",
@@ -36,15 +36,18 @@
         "yarn": ">=1.22.0 <2"
     },
     "build": {
-        "appId": "com.example.gitsyncvisualizer",
+        "appId": "com.example.kksync",
+        "productName": "KK Sync",
         "files": [
             "dist/",
             "src/main/",
             "src/assets/img/logo.ico",
+            "src/assets/img/logo_ico_256x256.ico",
             "src/assets/img/logo.png",
             "src/preload.cjs",
             "package.json"
         ],
+        "artifactName": "KK Sync ${version}.${ext}",
         "directories": {
             "output": "release"
         },
@@ -53,6 +56,7 @@
         },
         "win": {
             "icon": "src/assets/img/logo.ico",
+            "executableName": "KK Sync",
             "target": [
                 "portable"
             ]
