@@ -6,7 +6,8 @@ import { gitService } from './gitService.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const isDev = process.env.NODE_ENV !== 'production';
+// 以 app.isPackaged 为准，避免打包后误判为开发环境
+const isDev = !app.isPackaged;
 
 let mainWindow = null;
 
@@ -37,7 +38,8 @@ async function createWindow() {
         await mainWindow.loadURL(devServerUrl);
         mainWindow.webContents.openDevTools({ mode: 'detach' });
     } else {
-        mainWindow.loadFile(path.join(__dirname, '../../dist/renderer/index.html'));
+        const rendererIndex = path.join(__dirname, '../../dist/renderer/index.html');
+        await mainWindow.loadFile(rendererIndex);
     }
 
     mainWindow.once('ready-to-show', () => {
