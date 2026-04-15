@@ -38,8 +38,10 @@ const writeLastRepoPath = (key, value) => {
 
 const resolveTrayIcon = () => {
     const iconCandidates = [
-        path.join(__dirname, '../../image.png'),
-        path.join(process.cwd(), 'image.png')
+        path.join(__dirname, '../assets/img/logo.ico'),
+        path.join(__dirname, '../assets/img/logo.png'),
+        path.join(process.cwd(), 'src/assets/img/logo.ico'),
+        path.join(process.cwd(), 'src/assets/img/logo.png')
     ];
     const iconPath = iconCandidates.find((p) => existsSync(p));
     if (iconPath) {
@@ -98,6 +100,7 @@ async function createWindow() {
         backgroundColor: '#1f1f1f',
         show: false,
         autoHideMenuBar: true,
+        icon: resolveTrayIcon(),
         webPreferences: {
             preload: path.join(__dirname, '../preload.cjs'),
             nodeIntegration: false,

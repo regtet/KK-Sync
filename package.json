@@ -27,6 +27,7 @@
         "electron-builder": "^24.13.3",
         "eslint": "^8.56.0",
         "eslint-plugin-vue": "^9.20.1",
+        "to-ico": "^1.1.5",
         "vite": "^5.2.0",
         "wait-on": "^7.0.1"
     },
@@ -39,6 +40,8 @@
         "files": [
             "dist/",
             "src/main/",
+            "src/assets/img/logo.ico",
+            "src/assets/img/logo.png",
             "src/preload.cjs",
             "package.json"
         ],
@@ -49,7 +52,10 @@
             "category": "public.app-category.developer-tools"
         },
         "win": {
-            "target": ["portable"]
+            "icon": "src/assets/img/logo.ico",
+            "target": [
+                "portable"
+            ]
         },
         "linux": {
             "target": [
