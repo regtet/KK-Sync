@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage, shell, clipboard } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
@@ -307,6 +307,30 @@ ipcMain.handle('patch:select', async () => {
         }
 
         return { ok: true, data: { path: result.filePaths[0] } };
+    } catch (error) {
+        return { ok: false, error: error?.message ?? String(error) };
+    }
+});
+
+ipcMain.handle('app:open-external', async (_, url) => {
+    try {
+        if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) {
+            return { ok: false, error: '无效的链接地址' };
+        }
+        await shell.openExternal(url);
+        return { ok: true };
+    } catch (error) {
+        return { ok: false, error: error?.message ?? String(error) };
+    }
+});
+
+ipcMain.handle('app:copy-text', async (_, text) => {
+    try {
+        if (typeof text !== 'string') {
+            return { ok: false, error: '无效的复制内容' };
+        }
+        clipboard.writeText(text);
+        return { ok: true };
     } catch (error) {
         return { ok: false, error: error?.message ?? String(error) };
     }

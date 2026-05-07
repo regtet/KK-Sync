@@ -15,6 +15,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('repo:check-remote-branches', { branchNames, repoIndex }),
   listStashes: (repoIndex = 1) => ipcRenderer.invoke('repo:list-stash', repoIndex),
   selectPatchFile: () => ipcRenderer.invoke('patch:select'),
+  openExternal: (url) => ipcRenderer.invoke('app:open-external', url),
+  copyText: (text) => ipcRenderer.invoke('app:copy-text', text),
   startSync: (payload) => ipcRenderer.invoke('sync:start', payload),
   cancelSync: (repoIndex = 1) => ipcRenderer.invoke('sync:cancel', repoIndex),
   onSyncLog: (callback) => {

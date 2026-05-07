@@ -6,6 +6,14 @@
         <span class="title-text">KK Sync</span>
       </div>
       <div class="actions">
+        <button
+          class="repo-link"
+          type="button"
+          title="打开 GitHub 仓库"
+          @click="openGithubRepo"
+        >
+          GitHub 仓库
+        </button>
         <div class="theme-toggle">
           <button
             v-for="theme in themes"
@@ -92,6 +100,22 @@ const dismissNotification = (id) => {
 
 const setTheme = (theme) => {
   currentTheme.value = theme;
+};
+
+const githubRepoUrl = 'https://github.com/regtet/KK-Sync';
+
+const openGithubRepo = async () => {
+  const copyResult = await window.electronAPI?.copyText?.(githubRepoUrl);
+  if (!copyResult?.ok) {
+    pushNotification('warn', '地址复制失败，继续尝试打开浏览器');
+  }
+
+  const openResult = await window.electronAPI?.openExternal?.(githubRepoUrl);
+  if (openResult?.ok) {
+    pushNotification('success', '已复制地址，并在默认浏览器打开');
+  } else {
+    pushNotification('error', openResult?.error || '打开浏览器失败');
+  }
 };
 
 const applyTheme = (theme) => {
@@ -299,6 +323,29 @@ onBeforeUnmount(() => {
   display: inline-flex;
   gap: 12px;
   align-items: center;
+}
+
+.repo-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 34px;
+  padding: 0 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  background: rgba(30, 41, 59, 0.45);
+  color: rgba(226, 232, 240, 0.88);
+  text-decoration: none;
+  cursor: pointer;
+  font-size: 12px;
+  letter-spacing: 0.3px;
+  transition: border 0.2s ease, background 0.2s ease, color 0.2s ease;
+}
+
+.repo-link:hover {
+  border-color: rgba(96, 165, 250, 0.55);
+  background: rgba(59, 130, 246, 0.24);
+  color: #f8fafc;
 }
 
 .theme-toggle {
