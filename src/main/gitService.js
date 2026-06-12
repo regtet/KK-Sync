@@ -72,31 +72,44 @@ class GitService extends EventEmitter {
         };
     }
 
-    async getBranches(repoIndex = 1) {
+    async getRemotes(repoIndex = 1) {
+        const git = this.getGitByRepoIndex(repoIndex);
+        const remotes = await git.getRemotes(true);
+        return remotes
+            .filter((remote) => remote.name)
+            .map((remote) => ({
+                name: remote.name,
+                url: remote.refs?.fetch || remote.refs?.push || ''
+            }))
+            .sort((a, b) => a.name.localeCompare(b.name));
+    }
+
+    normalizeRemoteBranchName(refName) {
+        if (!refName?.startsWith('remotes/')) return null;
+        const normalized = refName.replace(/^remotes\/[^/]+\//, '').trim();
+        if (!normalized || normalized === 'HEAD' || normalized.includes('->')) {
+            return null;
+        }
+        return normalized;
+    }
+
+    matchesRemoteRef(refName, remoteName) {
+        if (!refName?.startsWith('remotes/')) return false;
+        if (!remoteName) return true;
+        return refName.startsWith(`remotes/${remoteName}/`);
+    }
+
+    async getBranches(repoIndex = 1, remoteName = null) {
         const git = this.getGitByRepoIndex(repoIndex);
         await git.fetch(['--all']);
         const branchSummary = await git.branch(['-a']);
         const current = branchSummary.current;
 
-        // 只处理远程分支，忽略本地分支
         const remoteBranches = branchSummary.all
-            .filter((name) => name.startsWith('remotes/'))
-            .map((name) => {
-                // 移除 remotes/[remote-name]/ 前缀（匹配所有远程仓库）
-                // 例如：remotes/origin/main -> main, remotes/upstream/feature -> feature
-                let normalized = name.replace(/^remotes\/[^/]+\//, '');
-                // 移除可能的额外空格并trim
-                normalized = normalized.trim();
-                return normalized;
-            })
-            .filter((name) => {
-                // 过滤掉空值、HEAD 引用和指向其他分支的引用
-                if (!name || name === 'HEAD') return false;
-                if (name.includes('->')) return false; // 过滤如 remotes/origin/HEAD -> origin/main
-                return true;
-            });
+            .filter((name) => this.matchesRemoteRef(name, remoteName))
+            .map((name) => this.normalizeRemoteBranchName(name))
+            .filter(Boolean);
 
-        // 去重并排序
         const unique = Array.from(new Set(remoteBranches)).sort();
         return { branches: unique, current };
     }
@@ -106,31 +119,26 @@ class GitService extends EventEmitter {
      * @param {string[]} branchNames - 要检查的分支名数组
      * @returns {Promise<{exists: string[], notExists: string[]}>} 返回存在和不存在的分支列表
      */
-    async checkRemoteBranches(branchNames, repoIndex = 1) {
+    async checkRemoteBranches(branchNames, repoIndex = 1, remoteName = null) {
         const git = this.getGitByRepoIndex(repoIndex);
         if (!Array.isArray(branchNames) || branchNames.length === 0) {
             return { exists: [], notExists: [] };
         }
 
-        // 先获取最新的远程分支列表（使用与 getBranches 相同的逻辑）
         await git.fetch(['--all']);
         const branchSummary = await git.branch(['-a']);
 
-        // 构建远程分支名集合（使用与 getBranches 相同的处理逻辑）
-        // 同时维护一个「小写分支名 -> 实际分支名」的映射，用于忽略大小写匹配
         const remoteBranchSet = new Set();
-        const remoteBranchMap = new Map(); // key: lower-case name, value: real case name
+        const remoteBranchMap = new Map();
         branchSummary.all
-            .filter((name) => name.startsWith('remotes/'))
+            .filter((name) => this.matchesRemoteRef(name, remoteName))
             .forEach((name) => {
-                const normalized = name.replace(/^remotes\/[^/]+\//, '').trim();
-                if (normalized && normalized !== 'HEAD' && !normalized.includes('->')) {
-                    remoteBranchSet.add(normalized);
-                    const lower = normalized.toLowerCase();
-                    // 如果多个远程里有同名（大小写不同）分支，保留第一次出现的即可
-                    if (!remoteBranchMap.has(lower)) {
-                        remoteBranchMap.set(lower, normalized);
-                    }
+                const normalized = this.normalizeRemoteBranchName(name);
+                if (!normalized) return;
+                remoteBranchSet.add(normalized);
+                const lower = normalized.toLowerCase();
+                if (!remoteBranchMap.has(lower)) {
+                    remoteBranchMap.set(lower, normalized);
                 }
             });
 
@@ -166,11 +174,11 @@ class GitService extends EventEmitter {
      * @param {string} branchName - 要检查的分支名
      * @returns {Promise<boolean>} 分支是否存在
      */
-    async checkRemoteBranchExists(branchName, repoIndex = 1) {
+    async checkRemoteBranchExists(branchName, repoIndex = 1, remoteName = null) {
         if (!branchName || !branchName.trim()) {
             return false;
         }
-        const result = await this.checkRemoteBranches([branchName.trim()], repoIndex);
+        const result = await this.checkRemoteBranches([branchName.trim()], repoIndex, remoteName);
         return result.exists.length > 0;
     }
 
@@ -179,7 +187,7 @@ class GitService extends EventEmitter {
      * @param {string} branchName - 分支名
      * @returns {Promise<string|null>} 远程分支的完整引用路径，如果不存在返回 null
      */
-    async findRemoteBranchRef(branchName, repoIndex = 1) {
+    async findRemoteBranchRef(branchName, repoIndex = 1, remoteName = null) {
         const git = this.getGitByRepoIndex(repoIndex);
         if (!branchName || !branchName.trim()) {
             return null;
@@ -190,11 +198,10 @@ class GitService extends EventEmitter {
 
         const trimmed = branchName.trim();
         for (const name of branchSummary.all) {
-            if (name.startsWith('remotes/')) {
-                const normalized = name.replace(/^remotes\/[^/]+\//, '').trim();
-                if (normalized === trimmed) {
-                    return name; // 返回完整路径如 remotes/origin/main
-                }
+            if (!this.matchesRemoteRef(name, remoteName)) continue;
+            const normalized = this.normalizeRemoteBranchName(name);
+            if (normalized === trimmed) {
+                return name;
             }
         }
         return null;
@@ -255,7 +262,8 @@ class GitService extends EventEmitter {
 
         const {
             targetBranches,
-            commitHash
+            commitHash,
+            remoteName: selectedRemote
         } = options;
 
         if (!targetBranches?.length) {
@@ -317,10 +325,11 @@ class GitService extends EventEmitter {
                     let checkedOut = false;
 
                     // 检查远程分支是否存在并获取引用（分支已经过验证，必须存在）
-                    const remoteRef = await this.findRemoteBranchRef(target, repoIndex);
+                    const remoteRef = await this.findRemoteBranchRef(target, repoIndex, selectedRemote);
                     if (!remoteRef) {
+                        const remoteHint = selectedRemote ? `远程 ${selectedRemote}` : '远程仓库';
                         throw new Error(
-                            `远程分支 ${target} 不存在，无法进行同步。请确保分支已存在于远程仓库。`
+                            `分支 ${target} 在${remoteHint}中不存在，无法进行同步。请确认远程仓库选择是否正确。`
                         );
                     }
 
@@ -385,8 +394,8 @@ class GitService extends EventEmitter {
 
                     // 推送分支到远程（远程分支已存在，直接推送）
                     const pushBranch = async () => {
-                        await git.push();
-                        log(`[${target}] 推送成功`);
+                        await git.push(remoteName, target);
+                        log(`[${target}] 已推送到 ${remoteBranchRef}`);
                     };
 
                     cherryPickStarted = true;
@@ -432,7 +441,7 @@ class GitService extends EventEmitter {
                                     checkCancelled();
                                     log(`[${target}] 第 ${retryCount} 次重试推送...`, 'info');
                                     await new Promise(resolve => setTimeout(resolve, 2000)); // 等待2秒后重试
-                                    await git.push();
+                                    await git.push(remoteName, target);
                                     log(`[${target}] 重试推送成功！`, 'info');
                                     retrySuccess = true;
                                     break;

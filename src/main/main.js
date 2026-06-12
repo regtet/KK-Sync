@@ -180,6 +180,11 @@ const relayLog = withLogRelay('sync:log');
 
 gitService.on('log', relayLog);
 
+const pickDefaultRemote = (remotes = []) => {
+    if (!Array.isArray(remotes) || remotes.length === 0) return null;
+    return remotes.find((remote) => remote.name === 'origin')?.name ?? remotes[0].name;
+};
+
 ipcMain.handle('repo:select', async () => {
     const lastPaths = readLastRepoPaths();
     const result = await dialog.showOpenDialog(mainWindow, {
@@ -194,12 +199,16 @@ ipcMain.handle('repo:select', async () => {
     const repoPath = result.filePaths[0];
     try {
         const info = await gitService.setRepository(repoPath);
-        const branches = await gitService.getBranches(1);
+        const remotes = await gitService.getRemotes(1);
+        const defaultRemote = pickDefaultRemote(remotes);
+        const branches = await gitService.getBranches(1, defaultRemote);
         writeLastRepoPath('repo1', repoPath);
         return {
             canceled: false,
             repo: info,
-            branches
+            branches,
+            remotes,
+            defaultRemote
         };
     } catch (error) {
         return {
@@ -223,12 +232,16 @@ ipcMain.handle('repo:select2', async () => {
     const repoPath = result.filePaths[0];
     try {
         const info = await gitService.setRepository2(repoPath);
-        const branches = await gitService.getBranches(2);
+        const remotes = await gitService.getRemotes(2);
+        const defaultRemote = pickDefaultRemote(remotes);
+        const branches = await gitService.getBranches(2, defaultRemote);
         writeLastRepoPath('repo2', repoPath);
         return {
             canceled: false,
             repo: info,
-            branches
+            branches,
+            remotes,
+            defaultRemote
         };
     } catch (error) {
         return {
@@ -260,9 +273,22 @@ ipcMain.handle('repo:info', async (_, repoIndex = 1) => {
     }
 });
 
-ipcMain.handle('repo:list-branches', async (_, repoIndex = 1) => {
+ipcMain.handle('repo:list-remotes', async (_, repoIndex = 1) => {
     try {
-        const branches = await gitService.getBranches(repoIndex);
+        const remotes = await gitService.getRemotes(repoIndex);
+        return { ok: true, data: remotes };
+    } catch (error) {
+        return { ok: false, error: error?.message ?? String(error) };
+    }
+});
+
+ipcMain.handle('repo:list-branches', async (_, payload) => {
+    try {
+        const repoIndex =
+            typeof payload === 'number' ? payload : payload?.repoIndex ?? 1;
+        const remoteName =
+            typeof payload === 'object' && payload ? payload.remoteName ?? null : null;
+        const branches = await gitService.getBranches(repoIndex, remoteName);
         return { ok: true, data: branches };
     } catch (error) {
         return { ok: false, error: error?.message ?? String(error) };
@@ -285,7 +311,15 @@ ipcMain.handle('repo:check-remote-branches', async (_, payload) => {
             typeof payload === 'object' && payload && !Array.isArray(payload)
                 ? payload.repoIndex ?? 1
                 : 1;
-        const result = await gitService.checkRemoteBranches(branchNames ?? [], repoIndex);
+        const remoteName =
+            typeof payload === 'object' && payload && !Array.isArray(payload)
+                ? payload.remoteName ?? null
+                : null;
+        const result = await gitService.checkRemoteBranches(
+            branchNames ?? [],
+            repoIndex,
+            remoteName
+        );
         return { ok: true, data: result };
     } catch (error) {
         return { ok: false, error: error?.message ?? String(error) };

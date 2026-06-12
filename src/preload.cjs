@@ -10,9 +10,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   clearRepository2: () => ipcRenderer.invoke('repo:clear2'),
   hasRepository: (repoIndex = 1) => ipcRenderer.invoke('repo:has', repoIndex),
   getRepositoryInfo: (repoIndex = 1) => ipcRenderer.invoke('repo:info', repoIndex),
-  listBranches: (repoIndex = 1) => ipcRenderer.invoke('repo:list-branches', repoIndex),
-  checkRemoteBranches: (branchNames, repoIndex = 1) =>
-    ipcRenderer.invoke('repo:check-remote-branches', { branchNames, repoIndex }),
+  listRemotes: (repoIndex = 1) => ipcRenderer.invoke('repo:list-remotes', repoIndex),
+  listBranches: (repoIndex = 1, remoteName = null) =>
+    ipcRenderer.invoke('repo:list-branches', { repoIndex, remoteName }),
+  checkRemoteBranches: (branchNames, repoIndex = 1, remoteName = null) =>
+    ipcRenderer.invoke('repo:check-remote-branches', { branchNames, repoIndex, remoteName }),
   listStashes: (repoIndex = 1) => ipcRenderer.invoke('repo:list-stash', repoIndex),
   selectPatchFile: () => ipcRenderer.invoke('patch:select'),
   openExternal: (url) => ipcRenderer.invoke('app:open-external', url),

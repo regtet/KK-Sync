@@ -31,6 +31,7 @@
         <branch-selector
           :branches="branches"
           :repo-index="repoIndex"
+          :remote-name="selectedRemote"
           :hide-source="true"
           v-model:source-branch="sourceBranch"
           v-model:target-branches="selectedTargets"
@@ -40,7 +41,13 @@
       </div>
 
       <div class="right">
-        <repo-info :repo-info="repoInfo" :loading="loading" />
+        <repo-info
+          :repo-info="repoInfo"
+          :loading="loading"
+          :remotes="remotes"
+          :selected-remote="selectedRemote"
+          @update:selected-remote="handleRemoteChange"
+        />
         <div class="actions">
           <button
             v-if="syncing"
@@ -74,6 +81,8 @@ const props = defineProps({
 const emit = defineEmits(['notify', 'sync-change']);
 
 const repoInfo = ref(null);
+const remotes = ref([]);
+const selectedRemote = ref('');
 const branches = ref({ list: [], current: '' });
 const sourceBranch = ref('');
 const selectedTargets = ref([]);
@@ -84,6 +93,7 @@ const syncing = ref(false);
 const isSyncDisabled = computed(() => {
   if (syncing.value) return true;
   if (!repoInfo.value) return true;
+  if (!selectedRemote.value) return true;
   if (!commitHash.value) return true;
   if (!selectedTargets.value.length) return true;
   return false;
@@ -95,6 +105,50 @@ const normalizeBranches = (payload) => ({
   current: payload?.current ?? ''
 });
 
+const pickDefaultRemote = (remoteList = []) => {
+  if (!remoteList.length) return '';
+  return remoteList.find((remote) => remote.name === 'origin')?.name ?? remoteList[0].name;
+};
+
+const loadRemotes = async () => {
+  if (!window.electronAPI?.listRemotes) return [];
+  const result = await window.electronAPI.listRemotes(props.repoIndex);
+  if (!result?.ok) {
+    throw new Error(result?.error || `仓库${props.repoIndex} 远程列表读取失败`);
+  }
+  return result.data ?? [];
+};
+
+const loadBranches = async (remoteName = selectedRemote.value) => {
+  if (!remoteName || !window.electronAPI?.listBranches) return;
+  const branchResult = await window.electronAPI.listBranches(props.repoIndex, remoteName);
+  if (branchResult?.ok) {
+    branches.value = normalizeBranches(branchResult.data);
+    if (!sourceBranch.value) sourceBranch.value = branches.value.current;
+  }
+};
+
+const applyRemoteSelection = async (remoteName, { clearTargets = false } = {}) => {
+  selectedRemote.value = remoteName;
+  if (clearTargets) {
+    selectedTargets.value = [];
+  }
+  await loadBranches(remoteName);
+};
+
+const handleRemoteChange = async (remoteName) => {
+  if (!remoteName || remoteName === selectedRemote.value) return;
+  loading.value = true;
+  try {
+    await applyRemoteSelection(remoteName, { clearTargets: true });
+    notify('success', `已切换到远程 ${remoteName}`);
+  } catch (error) {
+    notify('error', error?.message || `切换远程仓库失败`);
+  } finally {
+    loading.value = false;
+  }
+};
+
 const refresh = async () => {
   if (!window.electronAPI?.hasRepository) return;
   const hasResult = await window.electronAPI.hasRepository(props.repoIndex);
@@ -103,11 +157,11 @@ const refresh = async () => {
   try {
     const info = await window.electronAPI.getRepositoryInfo(props.repoIndex);
     if (info?.ok) repoInfo.value = info.data;
-    const branchResult = await window.electronAPI.listBranches(props.repoIndex);
-    if (branchResult?.ok) {
-      branches.value = normalizeBranches(branchResult.data);
-      if (!sourceBranch.value) sourceBranch.value = branches.value.current;
-    }
+    remotes.value = await loadRemotes();
+    const nextRemote = remotes.value.some((remote) => remote.name === selectedRemote.value)
+      ? selectedRemote.value
+      : pickDefaultRemote(remotes.value);
+    await applyRemoteSelection(nextRemote);
   } catch (error) {
     notify('error', error?.message || `仓库${props.repoIndex} 信息读取失败`);
   } finally {
@@ -129,9 +183,11 @@ const selectRepo = async () => {
       return;
     }
     repoInfo.value = result.repo ?? null;
-    branches.value = normalizeBranches(result.branches);
-    sourceBranch.value = branches.value.current || '';
+    remotes.value = result.remotes ?? await loadRemotes();
+    const nextRemote = result.defaultRemote || pickDefaultRemote(remotes.value);
     selectedTargets.value = [];
+    sourceBranch.value = '';
+    await applyRemoteSelection(nextRemote);
     notify('success', `仓库${props.repoIndex} 选择成功`);
   } finally {
     loading.value = false;
@@ -148,6 +204,8 @@ const clearRepo2 = async () => {
       return;
     }
     repoInfo.value = null;
+    remotes.value = [];
+    selectedRemote.value = '';
     branches.value = { list: [], current: '' };
     sourceBranch.value = '';
     selectedTargets.value = [];
@@ -166,6 +224,7 @@ const startSync = async () => {
       repoIndex: props.repoIndex,
       mode: 'commit',
       commitHash: commitHash.value,
+      remoteName: selectedRemote.value,
       targetBranches: [...selectedTargets.value]
     };
     const response = await window.electronAPI.startSync(payload);

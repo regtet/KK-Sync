@@ -29,11 +29,10 @@
           v-model="bulkInput"
           class="bulk-input"
           placeholder="批量粘贴分支名，每行一个，支持去除括号备注"
-          @paste="handleBulkPaste"
         ></textarea>
         <div class="bulk-actions">
           <button type="button" class="bulk-btn" :disabled="checkingRemote" @click="applyBulkInput">
-            {{ checkingRemote ? '添加中...' : '添加到目标分支' }}
+            {{ checkingRemote ? '查询中...' : '查询' }}
           </button>
           <button type="button" class="bulk-btn secondary" @click="clearTargets">
             清空已选
@@ -85,6 +84,10 @@ const props = defineProps({
   repoIndex: {
     type: Number,
     default: 1
+  },
+  remoteName: {
+    type: String,
+    default: ''
   }
 });
 
@@ -96,7 +99,6 @@ const targetSearch = ref('');
 const bulkInput = ref('');
 const bulkFeedback = ref('');
 const checkingRemote = ref(false);
-let pasteAutoAddTimer = null;
 
 const arraysEqual = (a, b) => {
   if (a.length !== b.length) return false;
@@ -183,8 +185,12 @@ const applyBulkInput = async () => {
     return;
   }
 
-  // 显示查询状态
-  bulkFeedback.value = '正在查询远程分支...';
+  if (!props.remoteName) {
+    bulkFeedback.value = '请先在右侧选择远程仓库';
+    return;
+  }
+
+  bulkFeedback.value = `正在查询远程 ${props.remoteName} 的分支...`;
   checkingRemote.value = true;
 
   try {
@@ -194,7 +200,11 @@ const applyBulkInput = async () => {
       return;
     }
 
-    const result = await window.electronAPI.checkRemoteBranches(entries, props.repoIndex);
+    const result = await window.electronAPI.checkRemoteBranches(
+      entries,
+      props.repoIndex,
+      props.remoteName || null
+    );
 
     if (!result?.ok) {
       bulkFeedback.value = `查询失败：${result?.error || '未知错误'}`;
@@ -229,14 +239,6 @@ const applyBulkInput = async () => {
   } finally {
     checkingRemote.value = false;
   }
-};
-
-const handleBulkPaste = () => {
-  // 粘贴场景下自动触发“添加到目标分支”，贴合“手动输入后自动添加”的使用习惯
-  if (pasteAutoAddTimer) clearTimeout(pasteAutoAddTimer);
-  pasteAutoAddTimer = setTimeout(() => {
-    applyBulkInput();
-  }, 120);
 };
 
 const clearTargets = () => {
