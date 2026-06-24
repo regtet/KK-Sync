@@ -99,44 +99,8 @@ class GitService extends EventEmitter {
         return refName.startsWith(`remotes/${remoteName}/`);
     }
 
-    extractFailedRemoteNames(error) {
-        const message = error?.message ?? String(error);
-        const names = new Set();
-        const refRegex = /refs\/remotes\/([^/\s]+)\//g;
-        let match = refRegex.exec(message);
-        while (match) {
-            names.add(match[1]);
-            match = refRegex.exec(message);
-        }
-        return Array.from(names);
-    }
-
-    async deleteRemoteRef(git, ref) {
-        try {
-            await git.raw(['update-ref', '-d', ref]);
-            return true;
-        } catch {
-            return false;
-        }
-    }
-
-    async clearRemoteTrackingRefs(git, remoteName = null) {
-        const branchSummary = await git.branch(['-a']);
-        const refsToDelete = branchSummary.all
-            .filter((name) => name.startsWith('remotes/'))
-            .filter((name) => !name.endsWith('/HEAD'))
-            .filter((name) => !remoteName || name.startsWith(`remotes/${remoteName}/`))
-            .map((name) => `refs/${name}`);
-
-        for (const ref of refsToDelete) {
-            await this.deleteRemoteRef(git, ref);
-        }
-
-        return refsToDelete.length;
-    }
-
     async fetchAll(git) {
-        await git.fetch(['--all', '--prune', '--force']);
+        await git.fetch(['--all', '--prune']);
     }
 
     async safeFetch(git) {
@@ -148,48 +112,61 @@ class GitService extends EventEmitter {
         try {
             await this.fetchAll(git);
             return { warnings: [] };
-        } catch (firstError) {
-            const failedRemotes = this.extractFailedRemoteNames(firstError);
-            const targets = failedRemotes.length
-                ? failedRemotes
-                : remotes.map((remote) => remote.name);
+        } catch (error) {
+            const reason = error?.message ?? String(error);
+            return {
+                warnings: [`fetch --all 失败，将使用已有远程跟踪分支，不会修改远程引用（${reason}）`]
+            };
+        }
+    }
 
-            let clearedCount = 0;
-            for (const remoteName of targets) {
-                clearedCount += await this.clearRemoteTrackingRefs(git, remoteName);
-            }
+    async switchAwayFromBranch(git, branchName) {
+        const current = (await git.branch()).current;
+        if (current !== branchName) return;
 
+        const locals = await git.branchLocal();
+        const fallback = locals.all.find((name) => name !== branchName);
+        if (fallback) {
+            await git.checkout(fallback);
+            return;
+        }
+
+        await git.checkout(['--detach']);
+    }
+
+    async cleanupSyncLocalBranches(git, { branchesCreatedDuringSync, branchToRestore, initialLocalBranches, log }) {
+        if (!branchesCreatedDuringSync?.size) return;
+
+        const restoreCandidates = [
+            branchToRestore,
+            ...[...initialLocalBranches].filter((name) => !branchesCreatedDuringSync.has(name))
+        ].filter((name, index, list) => name && list.indexOf(name) === index);
+
+        for (const candidate of restoreCandidates) {
             try {
-                await this.fetchAll(git);
-                return {
-                    warnings: [
-                        `检测到远程跟踪分支损坏，已清理 ${clearedCount} 条引用并重新 fetch --all`
-                    ]
-                };
-            } catch (retryError) {
-                for (const remoteName of targets) {
-                    await this.clearRemoteTrackingRefs(git, remoteName);
-                    try {
-                        await git.fetch(remoteName, [`+refs/heads/*:refs/remotes/${remoteName}/*`, '--prune']);
-                    } catch {
-                        // ignore per-remote force failure
-                    }
-                }
-
-                try {
-                    await this.fetchAll(git);
-                    return {
-                        warnings: [
-                            `远程跟踪分支损坏，已清空 ${clearedCount} 条引用并强制重新拉取`
-                        ]
-                    };
-                } catch (finalError) {
-                    const reason = finalError?.message ?? String(finalError);
-                    return {
-                        warnings: [`fetch --all 失败，将使用本地缓存分支（${reason}）`]
-                    };
-                }
+                await git.checkout(candidate);
+                break;
+            } catch {
+                // try next candidate
             }
+        }
+
+        for (const branchName of branchesCreatedDuringSync) {
+            try {
+                await this.switchAwayFromBranch(git, branchName);
+                await git.deleteLocalBranch(branchName, true);
+                log(`[${branchName}] 已清理同步时创建的本地分支`, 'info');
+            } catch (error) {
+                log(
+                    `[${branchName}] 清理本地分支失败: ${error?.message ?? error}`,
+                    'warn'
+                );
+            }
+        }
+
+        const currentBranch = (await git.branch()).current;
+        if (branchToRestore && currentBranch === branchToRestore) {
+            log(`已切回同步前分支 ${branchToRestore}`);
         }
     }
 
@@ -382,6 +359,8 @@ class GitService extends EventEmitter {
             const branchLocal = await git.branchLocal();
             const fallbackBranch = branchInfo.current;
             const branchToRestore = fallbackBranch;
+            const initialLocalBranches = new Set(branchLocal.all);
+            const branchesCreatedDuringSync = new Set();
 
             const log = (message, level = 'info') => {
                 const payload = {
@@ -408,25 +387,38 @@ class GitService extends EventEmitter {
                 }
             };
 
+            checkCancelled();
+            log('正在执行 git fetch --all --prune ...');
+            const fetchResult = await this.safeFetch(git);
+            if (fetchResult.warnings?.length) {
+                fetchResult.warnings.forEach((warning) => log(warning, 'warn'));
+            }
+            log('git fetch --all 完成');
+
+            const branchSummary = await git.branch(['-a']);
+            const resolveRemoteRef = (branchName) => {
+                const trimmed = branchName.trim();
+                for (const name of branchSummary.all) {
+                    if (!this.matchesRemoteRef(name, selectedRemote)) continue;
+                    const normalized = this.normalizeRemoteBranchName(name);
+                    if (normalized === trimmed) {
+                        return name;
+                    }
+                }
+                return null;
+            };
+
             for (const target of targetBranches) {
                 const result = { branch: target, success: true, error: null };
                 let cherryPickStarted = false;
+                let remoteName = selectedRemote;
                 try {
                     checkCancelled();
                     log(`开始同步到分支 ${target}（精准提交）`);
-                    await this.safeFetch(git);
-                    log(`[${target}] git fetch 完成`);
-                    checkCancelled();
 
                     let checkedOut = false;
 
-                    // 检查远程分支是否存在并获取引用（分支已经过验证，必须存在）
-                    const remoteRef = await this.findRemoteBranchRef(
-                        target,
-                        repoIndex,
-                        selectedRemote,
-                        true
-                    );
+                    const remoteRef = resolveRemoteRef(target);
                     if (!remoteRef) {
                         const remoteHint = selectedRemote ? `远程 ${selectedRemote}` : '远程仓库';
                         throw new Error(
@@ -440,8 +432,8 @@ class GitService extends EventEmitter {
                     if (!remoteMatch) {
                         throw new Error(`无法解析远程分支引用：${remoteRef}`);
                     }
-                    const remoteName = remoteMatch[1]; // origin, upstream 等
-                    const remoteBranchName = remoteMatch[2]; // 分支名（从远程引用中提取，确保完全匹配）
+                    remoteName = remoteMatch[1];
+                    const remoteBranchName = remoteMatch[2];
                     const remoteBranchRef = `${remoteName}/${remoteBranchName}`; // origin/branch 格式
 
                     if (!branchLocal.all.includes(target)) {
@@ -450,6 +442,7 @@ class GitService extends EventEmitter {
                             await git.checkout(['-b', target, remoteBranchRef]);
                             log(`[${target}] 本地不存在，已从 ${remoteBranchRef} 创建并切换`);
                             branchLocal.all.push(target);
+                            branchesCreatedDuringSync.add(target);
                             checkedOut = true;
                         } catch (createError) {
                             throw new Error(
@@ -591,9 +584,18 @@ class GitService extends EventEmitter {
                 }
             }
 
-            // 精准提交模式不切回，保持操作分支
+            await this.cleanupSyncLocalBranches(git, {
+                branchesCreatedDuringSync,
+                branchToRestore,
+                initialLocalBranches,
+                log
+            });
+
             if (branchToRestore && !state.cancelRequested) {
-                log(`同步结束，当前分支保持在最后处理分支`);
+                const currentBranch = (await git.branch()).current;
+                if (currentBranch !== branchToRestore && !branchesCreatedDuringSync.has(branchToRestore)) {
+                    log(`同步结束，当前分支为 ${currentBranch}`);
+                }
             }
 
             if (state.cancelRequested) {
