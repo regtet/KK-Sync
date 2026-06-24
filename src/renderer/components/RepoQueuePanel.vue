@@ -125,6 +125,10 @@ const loadBranches = async (remoteName = selectedRemote.value) => {
   if (branchResult?.ok) {
     branches.value = normalizeBranches(branchResult.data);
     if (!sourceBranch.value) sourceBranch.value = branches.value.current;
+    const warnings = branchResult.data?.fetchWarnings;
+    if (Array.isArray(warnings) && warnings.length) {
+      notify('warn', warnings.join('；'));
+    }
   }
 };
 
