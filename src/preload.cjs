@@ -8,6 +8,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   selectRepository: () => ipcRenderer.invoke('repo:select'),
   selectRepository2: () => ipcRenderer.invoke('repo:select2'),
   clearRepository2: () => ipcRenderer.invoke('repo:clear2'),
+  restoreRepository: (repoIndex = 1) => ipcRenderer.invoke('repo:restore', repoIndex),
+  saveRepoSession: (payload) => ipcRenderer.invoke('repo:save-session', payload),
   hasRepository: (repoIndex = 1) => ipcRenderer.invoke('repo:has', repoIndex),
   getRepositoryInfo: (repoIndex = 1) => ipcRenderer.invoke('repo:info', repoIndex),
   listRemotes: (repoIndex = 1) => ipcRenderer.invoke('repo:list-remotes', repoIndex),
@@ -34,5 +36,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     };
     ipcRenderer.on('sync:status', listener);
     return buildRemoveListener('sync:status', listener);
-  }
+  },
+  googleSheetsAuthStatus: () => ipcRenderer.invoke('google-sheets-auth-status'),
+  googleSheetsLogin: () => ipcRenderer.invoke('google-sheets-login'),
+  googleSheetsLogout: () => ipcRenderer.invoke('google-sheets-logout'),
+  googleSheetsFetchRows: (options) => ipcRenderer.invoke('google-sheets-fetch-rows', options)
 });

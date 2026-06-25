@@ -41,11 +41,24 @@
         "files": [
             "dist/",
             "src/main/",
+            "src/main/client_secret*.json",
+            "client_secret*.json",
             "src/assets/img/logo.ico",
             "src/assets/img/logo_ico_256x256.ico",
             "src/assets/img/logo.png",
             "src/preload.cjs",
             "package.json"
+        ],
+        "asarUnpack": [
+            "src/main/client_secret*.json",
+            "client_secret*.json"
+        ],
+        "extraResources": [
+            {
+                "from": "src/main/",
+                "to": "credentials",
+                "filter": ["client_secret*.json"]
+            }
         ],
         "artifactName": "KK Sync ${version}.${ext}",
         "directories": {

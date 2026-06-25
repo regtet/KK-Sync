@@ -3,6 +3,13 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { gitService } from './gitService.js';
+import {
+  clearStoredTokens,
+  fetchSpreadsheetRows,
+  findOAuthClientSecretPath,
+  getGoogleAuthStatus,
+  loginWithGoogle,
+} from './googleSheets.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -35,6 +42,34 @@ const writeLastRepoPath = (key, value) => {
     } catch {
         // ignore persistence failure
     }
+};
+
+const writeRepoSession = (repoIndex, session = {}) => {
+    try {
+        const curr = readLastRepoPaths();
+        if (!curr.session || typeof curr.session !== 'object') {
+            curr.session = {};
+        }
+        curr.session[String(repoIndex)] = {
+            remote: session.remote ?? '',
+            commitHash: session.commitHash ?? '',
+            targetBranches: Array.isArray(session.targetBranches) ? session.targetBranches : []
+        };
+        writeFileSync(repoPathStoreFile, JSON.stringify(curr, null, 2), 'utf-8');
+    } catch {
+        // ignore persistence failure
+    }
+};
+
+const readRepoSession = (repoIndex) => {
+    const data = readLastRepoPaths();
+    const session = data?.session?.[String(repoIndex)];
+    if (!session || typeof session !== 'object') return null;
+    return {
+        remote: session.remote ?? '',
+        commitHash: session.commitHash ?? '',
+        targetBranches: Array.isArray(session.targetBranches) ? session.targetBranches : []
+    };
 };
 
 const resolveTrayIcon = () => {
@@ -185,6 +220,53 @@ const pickDefaultRemote = (remotes = []) => {
     return remotes.find((remote) => remote.name === 'origin')?.name ?? remotes[0].name;
 };
 
+const restoreRepositoryByIndex = async (repoIndex = 1) => {
+    const key = repoIndex === 2 ? 'repo2' : 'repo1';
+    const repoPath = readLastRepoPaths()[key];
+    if (!repoPath || !existsSync(repoPath)) {
+        return { ok: false, reason: 'no_saved_path' };
+    }
+    if (!existsSync(path.join(repoPath, '.git'))) {
+        return { ok: false, reason: 'invalid_repo' };
+    }
+
+    const info = repoIndex === 2
+        ? await gitService.setRepository2(repoPath)
+        : await gitService.setRepository(repoPath);
+    const remotes = await gitService.getRemotes(repoIndex);
+    const session = readRepoSession(repoIndex);
+    const defaultRemote = session?.remote && remotes.some((remote) => remote.name === session.remote)
+        ? session.remote
+        : pickDefaultRemote(remotes);
+    const branches = await gitService.getBranches(repoIndex, defaultRemote);
+    return {
+        ok: true,
+        repo: info,
+        remotes,
+        branches,
+        defaultRemote,
+        session
+    };
+};
+
+ipcMain.handle('repo:restore', async (_, repoIndex = 1) => {
+    try {
+        return await restoreRepositoryByIndex(repoIndex);
+    } catch (error) {
+        return { ok: false, error: error?.message ?? String(error) };
+    }
+});
+
+ipcMain.handle('repo:save-session', async (_, payload = {}) => {
+    try {
+        const repoIndex = payload?.repoIndex ?? 1;
+        writeRepoSession(repoIndex, payload);
+        return { ok: true };
+    } catch (error) {
+        return { ok: false, error: error?.message ?? String(error) };
+    }
+});
+
 ipcMain.handle('repo:select', async () => {
     const lastPaths = readLastRepoPaths();
     const result = await dialog.showOpenDialog(mainWindow, {
@@ -254,6 +336,8 @@ ipcMain.handle('repo:select2', async () => {
 ipcMain.handle('repo:clear2', async () => {
     try {
         await gitService.setRepository2(null);
+        writeLastRepoPath('repo2', '');
+        writeRepoSession(2, { remote: '', commitHash: '', targetBranches: [] });
         return { ok: true };
     } catch (error) {
         return { ok: false, error: error?.message ?? String(error) };
@@ -399,5 +483,98 @@ ipcMain.handle('sync:cancel', async (_, repoIndex = 1) => {
     return { ok: true };
   } catch (error) {
     return { ok: false, error: error?.message ?? String(error) };
+  }
+});
+
+function getGoogleCredentialSearchDirs() {
+  const dirs = [];
+  const seen = new Set();
+  const push = (...candidates) => {
+    for (const raw of candidates) {
+      if (!raw || typeof raw !== 'string') continue;
+      const normalized = path.normalize(raw);
+      if (seen.has(normalized)) continue;
+      seen.add(normalized);
+      dirs.push(normalized);
+    }
+  };
+
+  const appPath = app.getAppPath();
+
+  push(__dirname);
+  push(path.dirname(__dirname));
+  push(path.dirname(path.dirname(__dirname)));
+  push(appPath);
+  push(path.join(appPath, 'src', 'main'));
+  push(app.getPath('userData'));
+  push(process.cwd());
+
+  if (process.resourcesPath) {
+    push(process.resourcesPath);
+    push(path.join(process.resourcesPath, 'app'));
+    push(path.join(process.resourcesPath, 'app', 'src', 'main'));
+  }
+
+  if (process.execPath) {
+    const execDir = path.dirname(process.execPath);
+    push(execDir);
+    push(path.join(execDir, 'resources'));
+    push(path.join(execDir, 'resources', 'app'));
+    push(path.join(execDir, 'resources', 'app', 'src', 'main'));
+    push(path.join(execDir, 'resources', 'credentials'));
+  }
+
+  if (process.resourcesPath) {
+    push(path.join(process.resourcesPath, 'credentials'));
+  }
+
+  return dirs;
+}
+
+ipcMain.handle('google-sheets-auth-status', async () => {
+  try {
+    const userDataDir = app.getPath('userData');
+    const status = getGoogleAuthStatus(userDataDir);
+    const secretPath = findOAuthClientSecretPath(getGoogleCredentialSearchDirs());
+    return {
+      ok: true,
+      ...status,
+      hasClientSecret: Boolean(secretPath),
+      clientSecretPath: secretPath || '',
+    };
+  } catch (e) {
+    return { ok: false, message: e.message };
+  }
+});
+
+ipcMain.handle('google-sheets-login', async () => {
+  try {
+    const userDataDir = app.getPath('userData');
+    const result = await loginWithGoogle(userDataDir, getGoogleCredentialSearchDirs());
+    return result;
+  } catch (e) {
+    return { ok: false, message: e.message || 'Google 授权失败' };
+  }
+});
+
+ipcMain.handle('google-sheets-logout', async () => {
+  try {
+    clearStoredTokens(app.getPath('userData'));
+    return { ok: true, message: '已退出 Google 授权' };
+  } catch (e) {
+    return { ok: false, message: e.message };
+  }
+});
+
+ipcMain.handle('google-sheets-fetch-rows', async (_event, options = {}) => {
+  try {
+    const result = await fetchSpreadsheetRows(
+      app.getPath('userData'),
+      getGoogleCredentialSearchDirs(),
+      options
+    );
+    return result;
+  } catch (e) {
+    return { ok: false, message: e.message || '读取 Google 表格失败' };
   }
 });

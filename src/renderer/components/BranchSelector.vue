@@ -34,6 +34,9 @@
           <button type="button" class="bulk-btn" :disabled="checkingRemote" @click="applyBulkInput">
             {{ checkingRemote ? '查询中...' : '查询' }}
           </button>
+          <button type="button" class="bulk-btn secondary" @click="openSheetModal">
+            从表格导入
+          </button>
           <button type="button" class="bulk-btn secondary" @click="clearTargets">
             清空已选
           </button>
@@ -58,11 +61,19 @@
     <section v-else class="empty">
       <p>暂无分支信息，请先选择一个 Git 仓库。</p>
     </section>
+
+    <google-sheet-modal
+      v-model:visible="sheetModalVisible"
+      :repo-index="repoIndex"
+      :remote-name="remoteName"
+      @confirm="handleSheetImport"
+    />
   </div>
 </template>
 
 <script setup>
 import { computed, watch, ref } from 'vue';
+import GoogleSheetModal from './GoogleSheetModal.vue';
 
 const props = defineProps({
   branches: {
@@ -99,6 +110,18 @@ const targetSearch = ref('');
 const bulkInput = ref('');
 const bulkFeedback = ref('');
 const checkingRemote = ref(false);
+const sheetModalVisible = ref(false);
+
+const openSheetModal = () => {
+  sheetModalVisible.value = true;
+};
+
+const handleSheetImport = async (branchNames = []) => {
+  if (!Array.isArray(branchNames) || !branchNames.length) return;
+  bulkInput.value = branchNames.join('\n');
+  bulkFeedback.value = `已从表格导入 ${branchNames.length} 个项目名，正在查询远程分支…`;
+  await applyBulkInput();
+};
 
 const arraysEqual = (a, b) => {
   if (a.length !== b.length) return false;

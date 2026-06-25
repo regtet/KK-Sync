@@ -4,3 +4,5 @@ release
 yarn-error.log
 .DS_Store
 Thumbs.db
+google-oauth-tokens.json
+client_secret*.json

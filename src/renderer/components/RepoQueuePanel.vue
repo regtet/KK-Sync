@@ -70,7 +70,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 import BranchSelector from './BranchSelector.vue';
 import RepoInfo from './RepoInfo.vue';
 
@@ -104,6 +104,43 @@ const normalizeBranches = (payload) => ({
   list: payload?.list ?? payload?.branches ?? [],
   current: payload?.current ?? ''
 });
+
+const applyRepoResult = async (result, { resetTargets = false } = {}) => {
+  repoInfo.value = result.repo ?? null;
+  remotes.value = result.remotes ?? await loadRemotes();
+  const nextRemote = result.defaultRemote || pickDefaultRemote(remotes.value);
+  if (resetTargets) {
+    selectedTargets.value = [];
+    sourceBranch.value = '';
+  }
+  await applyRemoteSelection(nextRemote, { clearTargets: resetTargets });
+
+  const session = result.session;
+  if (session?.commitHash) {
+    commitHash.value = session.commitHash;
+  }
+  if (!resetTargets && Array.isArray(session?.targetBranches) && session.targetBranches.length) {
+    selectedTargets.value = [...session.targetBranches];
+  }
+};
+
+const persistSession = async () => {
+  if (!repoInfo.value || !window.electronAPI?.saveRepoSession) return;
+  await window.electronAPI.saveRepoSession({
+    repoIndex: props.repoIndex,
+    remote: selectedRemote.value,
+    commitHash: commitHash.value,
+    targetBranches: [...selectedTargets.value]
+  });
+};
+
+let persistTimer = null;
+const schedulePersistSession = () => {
+  if (persistTimer) clearTimeout(persistTimer);
+  persistTimer = setTimeout(() => {
+    persistSession();
+  }, 300);
+};
 
 const pickDefaultRemote = (remoteList = []) => {
   if (!remoteList.length) return '';
@@ -145,9 +182,26 @@ const handleRemoteChange = async (remoteName) => {
   loading.value = true;
   try {
     await applyRemoteSelection(remoteName, { clearTargets: true });
+    schedulePersistSession();
     notify('success', `已切换到远程 ${remoteName}`);
   } catch (error) {
     notify('error', error?.message || `切换远程仓库失败`);
+  } finally {
+    loading.value = false;
+  }
+};
+
+const restoreRepo = async () => {
+  if (!window.electronAPI?.restoreRepository) return false;
+  loading.value = true;
+  try {
+    const result = await window.electronAPI.restoreRepository(props.repoIndex);
+    if (!result?.ok) return false;
+    await applyRepoResult(result);
+    return true;
+  } catch (error) {
+    notify('error', error?.message || `仓库${props.repoIndex} 自动恢复失败`);
+    return false;
   } finally {
     loading.value = false;
   }
@@ -186,12 +240,8 @@ const selectRepo = async () => {
       notify('error', result.error);
       return;
     }
-    repoInfo.value = result.repo ?? null;
-    remotes.value = result.remotes ?? await loadRemotes();
-    const nextRemote = result.defaultRemote || pickDefaultRemote(remotes.value);
-    selectedTargets.value = [];
-    sourceBranch.value = '';
-    await applyRemoteSelection(nextRemote);
+    await applyRepoResult(result, { resetTargets: true });
+    schedulePersistSession();
     notify('success', `仓库${props.repoIndex} 选择成功`);
   } finally {
     loading.value = false;
@@ -256,7 +306,22 @@ const cancelSync = async () => {
   }
 };
 
-onMounted(refresh);
+onMounted(async () => {
+  const restored = await restoreRepo();
+  if (restored) {
+    notify('success', `已自动恢复仓库${props.repoIndex}`);
+  } else {
+    await refresh();
+  }
+});
+
+watch([commitHash, selectedTargets], () => {
+  schedulePersistSession();
+}, { deep: true });
+
+watch(selectedRemote, () => {
+  schedulePersistSession();
+});
 
 defineExpose({
   refresh,
