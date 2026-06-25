@@ -3,13 +3,13 @@
     <header>
       <h2>分支选择</h2>
     </header>
-    <section v-if="branchList.length" class="fields">
+    <section v-if="hasBranchGroups" class="fields">
       <div v-if="!props.hideSource" class="field">
         <label for="source-branch">源分支</label>
         <select id="source-branch" v-model="localSource" @change="onSourceChange">
           <option disabled value="">请选择源分支</option>
           <option
-            v-for="branch in branchList"
+            v-for="branch in flatBranchNames"
             :key="branch"
             :value="branch"
           >
@@ -18,17 +18,18 @@
         </select>
       </div>
       <div class="field target-field">
-        <label>目标分支</label>
+        <label>目标分支（按远程仓库分组）</label>
+        <p v-if="duplicateWarning" class="dup-warning">{{ duplicateWarning }}</p>
         <input
           v-model.trim="targetSearch"
           type="search"
           class="search-input"
-          placeholder="输入关键字快速筛选目标分支"
+          placeholder="筛选远程或分支名，如 origin / dev"
         />
         <textarea
           v-model="bulkInput"
           class="bulk-input"
-          placeholder="批量粘贴分支名，每行一个，支持去除括号备注"
+          placeholder="批量粘贴分支名，支持换行或逗号分隔；重名分支请写 远程/分支，如 origin/dev"
         ></textarea>
         <div class="bulk-actions">
           <button type="button" class="bulk-btn" :disabled="checkingRemote" @click="applyBulkInput">
@@ -40,21 +41,35 @@
           <button type="button" class="bulk-btn secondary" @click="clearTargets">
             清空已选
           </button>
+          <button
+            v-if="duplicateSet.size"
+            type="button"
+            class="bulk-btn danger"
+            :disabled="operationBusy"
+            @click="emit('cleanup-duplicates')"
+          >
+            删除重名旧分支
+          </button>
           <span v-if="bulkFeedback" class="bulk-feedback">{{ bulkFeedback }}</span>
         </div>
         <div class="target-list scroll-thin">
-          <label
-            v-for="branch in filteredTargets"
-            :key="branch"
-            class="checkbox target-item"
-          >
-            <input
-              type="checkbox"
-              :value="branch"
-              v-model="localTargets"
-            />
-            <span>{{ branch }}</span>
-          </label>
+          <template v-for="group in visibleGroups" :key="group.remote">
+            <div class="remote-group-header">{{ group.remote }}</div>
+            <label
+              v-for="ref in group.items"
+              :key="ref"
+              class="checkbox target-item"
+              :class="{ 'is-dup': isDuplicateRef(ref) }"
+            >
+              <input
+                type="checkbox"
+                :value="ref"
+                v-model="localTargets"
+              />
+              <span class="branch-label" :title="ref">{{ branchLabel(ref) }}</span>
+            </label>
+          </template>
+          <p v-if="!visibleGroups.length" class="empty-filter">暂无匹配分支</p>
         </div>
       </div>
     </section>
@@ -65,7 +80,6 @@
     <google-sheet-modal
       v-model:visible="sheetModalVisible"
       :repo-index="repoIndex"
-      :remote-name="remoteName"
       @confirm="handleSheetImport"
     />
   </div>
@@ -78,7 +92,7 @@ import GoogleSheetModal from './GoogleSheetModal.vue';
 const props = defineProps({
   branches: {
     type: Object,
-    default: () => ({ list: [], current: '' })
+    default: () => ({ groups: [], duplicates: [], current: '' })
   },
   sourceBranch: {
     type: String,
@@ -96,13 +110,19 @@ const props = defineProps({
     type: Number,
     default: 1
   },
-  remoteName: {
-    type: String,
-    default: ''
+  operationBusy: {
+    type: Boolean,
+    default: false
   }
 });
 
-const emit = defineEmits(['update:source-branch', 'update:target-branches', 'clear-targets']);
+const emit = defineEmits([
+  'update:source-branch',
+  'update:target-branches',
+  'clear-targets',
+  'notify',
+  'cleanup-duplicates'
+]);
 
 const localSource = ref(props.sourceBranch);
 const localTargets = ref([...props.targetBranches]);
@@ -111,6 +131,63 @@ const bulkInput = ref('');
 const bulkFeedback = ref('');
 const checkingRemote = ref(false);
 const sheetModalVisible = ref(false);
+
+const branchGroups = computed(() => props.branches?.groups ?? []);
+
+const hasBranchGroups = computed(() => branchGroups.value.some((g) => g.branches?.length));
+
+const duplicateSet = computed(
+  () => new Set((props.branches?.duplicates ?? []).map((name) => name.toLowerCase()))
+);
+
+const duplicateWarning = computed(() => {
+  const dups = props.branches?.duplicates ?? [];
+  if (!dups.length) return '';
+  return `警告：分支名 ${dups.join('、')} 在多个远程仓库中重复，请勾选时认准远程分组，或批量粘贴时使用 远程/分支 格式。`;
+});
+
+const flatBranchNames = computed(() => {
+  const names = new Set();
+  for (const group of branchGroups.value) {
+    for (const branch of group.branches ?? []) {
+      names.add(branch);
+    }
+  }
+  return [...names].sort();
+});
+
+const toRefKey = (remote, branch) => `${remote}/${branch}`;
+
+const branchLabel = (ref) => {
+  const slash = ref.indexOf('/');
+  if (slash < 0) return ref;
+  return ref.slice(slash + 1);
+};
+
+const isDuplicateRef = (ref) => {
+  const branch = branchLabel(ref);
+  return duplicateSet.value.has(branch.toLowerCase());
+};
+
+const visibleGroups = computed(() => {
+  const keyword = targetSearch.value.trim().toLowerCase();
+  const selectedSet = new Set(localTargets.value);
+  const previewLimit = 120;
+
+  return branchGroups.value
+    .map((group) => {
+      let items = (group.branches ?? []).map((branch) => toRefKey(group.remote, branch));
+      if (keyword) {
+        items = items.filter((ref) => ref.toLowerCase().includes(keyword));
+      } else {
+        const selectedInGroup = items.filter((ref) => selectedSet.has(ref));
+        const unselected = items.filter((ref) => !selectedSet.has(ref));
+        items = [...selectedInGroup, ...unselected.slice(0, previewLimit)];
+      }
+      return { remote: group.remote, items };
+    })
+    .filter((group) => group.items.length);
+});
 
 const openSheetModal = () => {
   sheetModalVisible.value = true;
@@ -155,51 +232,19 @@ watch(localTargets, (value) => {
   emitTargetBranches(value);
 });
 
-const filteredTargets = computed(() => {
-  const keyword = targetSearch.value.trim().toLowerCase();
-  const base = branchList.value;
-
-  if (!keyword) {
-    // 大仓库分支很多时，默认只渲染已选 + 前 200 条，减少 DOM 压力避免卡顿
-    const selectedSet = new Set(localTargets.value);
-    const preview = [];
-    for (const branch of base) {
-      if (!selectedSet.has(branch)) {
-        preview.push(branch);
-      }
-      if (preview.length >= 200) break;
-    }
-    return [...localTargets.value, ...preview];
-  }
-
-  const matched = base.filter((branch) => branch.toLowerCase().includes(keyword));
-  const selected = localTargets.value.filter((branch) => !matched.includes(branch));
-  return Array.from(new Set([...selected, ...matched]));
-});
-
 const sanitizeBranchName = (value = '') => {
   if (!value) return '';
 
   let v = value;
-
-  // 去掉中英文括号中的备注
   v = v.replace(/（[^）]*）/g, '').replace(/\([^)]*\)/g, '');
-
-  // 处理类似「we-camapg -3倍」「we-necklacepg 2倍」「we-conchapg 2倍」这类带倍数说明的文案
-  // - 可选的前导空格和连接符（-、–、—）
-  // - 阿拉伯数字或中文数字（支持 0-9 和 一二三四五六七八九十百千万）
-  // - 结尾的「倍」字
   v = v.replace(/\s*[-–—]?\s*[0-9一二三四五六七八九十百千万]+倍\s*$/u, '');
-
   return v.trim();
 };
-
-const branchList = computed(() => props.branches?.list ?? props.branches?.branches ?? []);
 
 const applyBulkInput = async () => {
   if (checkingRemote.value) return;
   const entries = bulkInput.value
-    .split(/\r?\n/)
+    .split(/[\r\n,，、;；\t]+/)
     .map((line) => sanitizeBranchName(line))
     .filter(Boolean);
 
@@ -208,16 +253,10 @@ const applyBulkInput = async () => {
     return;
   }
 
-  if (!props.remoteName) {
-    bulkFeedback.value = '请先在右侧选择远程仓库';
-    return;
-  }
-
-  bulkFeedback.value = `正在查询远程 ${props.remoteName} 的分支...`;
+  bulkFeedback.value = '正在查询所有远程仓库的分支...';
   checkingRemote.value = true;
 
   try {
-    // 查询远程分支验证分支是否存在
     if (!window.electronAPI?.checkRemoteBranches) {
       bulkFeedback.value = '当前环境不支持远程分支查询';
       return;
@@ -226,7 +265,7 @@ const applyBulkInput = async () => {
     const result = await window.electronAPI.checkRemoteBranches(
       entries,
       props.repoIndex,
-      props.remoteName || null
+      null
     );
 
     if (!result?.ok) {
@@ -234,29 +273,38 @@ const applyBulkInput = async () => {
       return;
     }
 
-    const { exists, notExists } = result.data || { exists: [], notExists: [] };
+    const { exists, notExists, ambiguous } = result.data || {
+      exists: [],
+      notExists: [],
+      ambiguous: []
+    };
 
-    // 只添加在远程存在的分支
     if (exists.length > 0) {
       const merged = Array.from(new Set([...localTargets.value, ...exists]));
       localTargets.value = merged;
       emitTargetBranches(merged);
     }
 
-    // 生成反馈信息
     const parts = [];
     if (exists.length > 0) {
-      parts.push(`已添加 ${exists.length} 个分支`);
+      parts.push(`已添加 ${exists.length} 个`);
+    }
+    if (ambiguous.length > 0) {
+      parts.push(
+        `重名未自动添加：${ambiguous
+          .map((item) => `${item.name}(${item.remotes.join('/')})`)
+          .join('；')}`
+      );
+      emit('notify', {
+        type: 'warn',
+        message: `分支重名：${ambiguous.map((item) => item.name).join('、')}，请手动勾选或写 远程/分支`
+      });
     }
     if (notExists.length > 0) {
       parts.push(`未找到：${notExists.join('，')}`);
     }
 
-    if (parts.length > 0) {
-      bulkFeedback.value = parts.join('；');
-    } else {
-      bulkFeedback.value = '未添加任何分支';
-    }
+    bulkFeedback.value = parts.length ? parts.join('；') : '未添加任何分支';
   } catch (error) {
     bulkFeedback.value = `查询远程分支失败：${error?.message || '未知错误'}`;
   } finally {
@@ -273,11 +321,11 @@ const clearTargets = () => {
 
 const onSourceChange = () => {
   emit('update:source-branch', localSource.value);
-  if (localTargets.value.includes(localSource.value)) {
-    localTargets.value = localTargets.value.filter(
-      (branch) => branch !== localSource.value
-    );
-    emitTargetBranches(localTargets.value);
+  const branch = localSource.value;
+  const removed = localTargets.value.filter((ref) => branchLabel(ref) !== branch);
+  if (removed.length !== localTargets.value.length) {
+    localTargets.value = removed;
+    emitTargetBranches(removed);
   }
 };
 </script>
@@ -321,6 +369,17 @@ header h2 {
   color: rgba(255, 255, 255, 0.68);
 }
 
+.dup-warning {
+  margin: 0;
+  padding: 8px 12px;
+  border-radius: 10px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warning) 35%, transparent);
+}
+
 select {
   width: 100%;
   min-height: 44px;
@@ -349,6 +408,7 @@ select {
 .bulk-actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 12px;
   margin: 8px 0 4px;
 }
@@ -371,6 +431,17 @@ select {
   background: color-mix(in srgb, var(--surface-muted) 60%, transparent);
 }
 
+.bulk-btn.danger {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+}
+
+.bulk-btn.danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 18%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--border));
+}
+
 .bulk-btn:hover {
   border-color: var(--border-strong);
   background: color-mix(in srgb, var(--surface-muted) 82%, transparent);
@@ -387,34 +458,51 @@ select {
 }
 
 .target-list {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-  gap: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
   min-height: 160px;
-  max-height: 280px;
+  max-height: 320px;
   padding: 12px;
   background: color-mix(in srgb, var(--surface-muted) 70%, transparent);
   border-radius: 14px;
   border: 1px dashed var(--border);
   overflow-y: auto;
   overflow-x: hidden;
-  contain: content;
-  scrollbar-width: none;
-  -ms-overflow-style: none;
 }
 
-.target-list::-webkit-scrollbar {
-  display: none;
+.remote-group-header {
+  margin-top: 8px;
+  padding: 4px 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent);
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+}
+
+.remote-group-header:first-child {
+  margin-top: 0;
+}
+
+.target-list .target-item {
+  display: flex;
+  margin-left: 4px;
 }
 
 .target-item {
   justify-content: flex-start;
   align-items: center;
-  padding: 10px 12px;
-  border-radius: 12px;
+  padding: 8px 10px;
+  border-radius: 10px;
   background: color-mix(in srgb, var(--surface-muted) 85%, transparent);
   border: 1px solid transparent;
   transition: border 0.2s ease, background 0.2s ease;
+}
+
+.target-item.is-dup {
+  border-color: color-mix(in srgb, var(--warning) 40%, transparent);
 }
 
 .target-item:hover {
@@ -422,12 +510,21 @@ select {
   background: color-mix(in srgb, var(--surface-muted) 92%, var(--accent) 8%);
 }
 
-.target-item span {
+.branch-label {
   flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  font-size: 12px;
+}
+
+.empty-filter {
+  margin: 12px 0;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-muted);
 }
 
 .empty {

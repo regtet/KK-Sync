@@ -46,20 +46,29 @@
           v-show="activeTab === 1"
           ref="panel1Ref"
           :repo-index="1"
+          :sync-progress="syncProgressByRepo[1]"
           @notify="handleNotify"
           @sync-change="handleSyncChange"
+          @log="appendLog"
         />
         <repo-queue-panel
           v-show="activeTab === 2"
           ref="panel2Ref"
           :repo-index="2"
+          :sync-progress="syncProgressByRepo[2]"
           @notify="handleNotify"
           @sync-change="handleSyncChange"
+          @log="appendLog"
         />
       </div>
 
       <section class="card log-card">
-        <log-view :logs="activeLogs" :syncing="!!syncingState[activeTab]" @clear="clearLogs" />
+        <log-view
+          :logs="activeLogs"
+          :syncing="!!syncingState[activeTab]"
+          :sync-progress="syncProgressByRepo[activeTab]"
+          @clear="clearLogs"
+        />
       </section>
     </main>
   </div>
@@ -79,6 +88,7 @@ const themes = [
 const activeTab = ref(1);
 const logsByRepo = ref({ 1: [], 2: [] });
 const syncingState = ref({ 1: false, 2: false });
+const syncProgressByRepo = ref({ 1: null, 2: null });
 const panel1Ref = ref(null);
 const panel2Ref = ref(null);
 
@@ -135,6 +145,8 @@ const resolveModeLabel = (mode) => {
   switch (mode) {
     case 'commit':
       return '精准提交';
+    case 'cleanup-duplicates':
+      return '清理重名分支';
     default:
       return mode || '未知模式';
   }
@@ -169,6 +181,16 @@ const appendLog = (log) => {
 const handleNotify = ({ type, message }) => pushNotification(type, message);
 const handleSyncChange = ({ repoIndex, syncing }) => {
   syncingState.value = { ...syncingState.value, [repoIndex]: syncing };
+  if (!syncing) {
+    syncProgressByRepo.value = { ...syncProgressByRepo.value, [repoIndex]: null };
+  }
+};
+
+const updateSyncProgress = (repoIndex, progress) => {
+  syncProgressByRepo.value = {
+    ...syncProgressByRepo.value,
+    [repoIndex]: progress
+  };
 };
 
 const clearLogs = () => {
@@ -231,32 +253,55 @@ onMounted(() => {
     switch (status.status) {
       case 'running':
         syncingState.value = { ...syncingState.value, [repoIndex]: true };
+        updateSyncProgress(repoIndex, {
+          current: 0,
+          total: status.total || 0,
+          branch: ''
+        });
         appendLog({
-          message: `[仓库${repoIndex}] 同步任务已启动（${modeLabel}）`,
+          message: `[仓库${repoIndex}] 任务已启动（${modeLabel}）${status.total ? `，共 ${status.total} 个分支` : ''}`,
           level: 'info',
           timestamp: now
         });
         break;
+      case 'progress':
+        syncingState.value = { ...syncingState.value, [repoIndex]: true };
+        updateSyncProgress(repoIndex, {
+          current: status.current || 0,
+          total: status.total || 0,
+          branch: status.branch || ''
+        });
+        break;
       case 'completed':
         syncingState.value = { ...syncingState.value, [repoIndex]: false };
-        summarizeResults(status.results, modeLabel, repoIndex);
-        if (repoIndex === 1) panel1Ref.value?.refresh?.();
-        if (repoIndex === 2) panel2Ref.value?.refresh?.();
+        updateSyncProgress(repoIndex, null);
+        if (status.mode === 'cleanup-duplicates') {
+          if (repoIndex === 1) panel1Ref.value?.refresh?.();
+          if (repoIndex === 2) panel2Ref.value?.refresh?.();
+        } else {
+          summarizeResults(status.results, modeLabel, repoIndex);
+          if (repoIndex === 1) panel1Ref.value?.refresh?.();
+          if (repoIndex === 2) panel2Ref.value?.refresh?.();
+        }
         break;
       case 'cancelled':
         syncingState.value = { ...syncingState.value, [repoIndex]: false };
+        updateSyncProgress(repoIndex, null);
         appendLog({
-          message: `[仓库${repoIndex}] 同步任务已被用户中止（${modeLabel}）`,
+          message: `[仓库${repoIndex}] 任务已被用户中止（${modeLabel}）`,
           level: 'warn',
           timestamp: now
         });
-        summarizeResults(status.results, modeLabel, repoIndex);
+        if (status.mode !== 'cleanup-duplicates') {
+          summarizeResults(status.results, modeLabel, repoIndex);
+          pushNotification('warn', '同步已中止');
+        }
         if (repoIndex === 1) panel1Ref.value?.refresh?.();
         if (repoIndex === 2) panel2Ref.value?.refresh?.();
-        pushNotification('warn', '同步已中止');
         break;
       case 'failed':
         syncingState.value = { ...syncingState.value, [repoIndex]: false };
+        updateSyncProgress(repoIndex, null);
         appendLog({
           message: `[仓库${repoIndex}] 同步任务失败（${modeLabel}）: ${status.message || '未知错误'}`,
           level: 'error',
@@ -266,6 +311,7 @@ onMounted(() => {
         break;
       default:
         syncingState.value = { ...syncingState.value, [repoIndex]: false };
+        updateSyncProgress(repoIndex, null);
     }
   });
 });

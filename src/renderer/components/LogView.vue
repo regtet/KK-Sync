@@ -5,7 +5,8 @@
             <div class="header-actions">
                 <button v-if="logs.length" class="icon-btn" title="清空日志" @click="emit('clear')"> 清空 </button>
                 <div class="status-pill" :class="syncing ? 'active' : ''">
-                    <span class="dot" :class="syncing ? 'running' : 'idle'"></span> {{ syncing ? '同步中' : '等待中' }}
+                    <span class="dot" :class="syncing ? 'running' : 'idle'"></span>
+                    {{ statusLabel }}
                 </div>
             </div>
         </header>
@@ -20,11 +21,11 @@
     </div>
 </template>
 <script setup>
-import { onUpdated, onMounted, onBeforeUnmount, ref } from 'vue';
+import { computed, onUpdated, onMounted, onBeforeUnmount, ref } from 'vue';
 
 const emit = defineEmits(['clear']);
 
-defineProps({
+const props = defineProps({
     logs: {
         type: Array,
         default: () => []
@@ -32,7 +33,20 @@ defineProps({
     syncing: {
         type: Boolean,
         default: false
+    },
+    syncProgress: {
+        type: Object,
+        default: null
     }
+});
+
+const statusLabel = computed(() => {
+    if (!props.syncing) return '等待中';
+    const progress = props.syncProgress;
+    if (!progress?.total) return '执行中';
+    const current = Math.min(progress.current || 0, progress.total);
+    const branch = progress.branch ? ` · ${progress.branch}` : '';
+    return `执行中 ${current}/${progress.total}${branch}`;
 });
 
 const scrollRef = ref(null);

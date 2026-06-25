@@ -99,6 +99,86 @@ class GitService extends EventEmitter {
         return refName.startsWith(`remotes/${remoteName}/`);
     }
 
+    formatRemoteBranchKey(remoteName, branchName) {
+        return `${remoteName}/${branchName}`;
+    }
+
+    /** 多远程重名时忽略的分支（如 main 各远程均有，不算重复） */
+    isIgnoredDuplicateBranch(branchName) {
+        const lower = String(branchName || '').trim().toLowerCase();
+        return lower === 'main';
+    }
+
+    splitBranchNameInput(branchNames) {
+        if (!Array.isArray(branchNames)) return [];
+        const result = [];
+        const seen = new Set();
+
+        for (const raw of branchNames) {
+            const text = String(raw ?? '').trim();
+            if (!text) continue;
+
+            const parts = text.split(/[\r\n,，、;；\t]+/);
+            for (const part of parts) {
+                const name = String(part ?? '').trim();
+                if (!name) continue;
+                const key = name.toLowerCase();
+                if (seen.has(key)) continue;
+                seen.add(key);
+                result.push(name);
+            }
+        }
+
+        return result;
+    }
+
+    parseSyncTarget(target, fallbackRemote = '') {
+        const raw = String(target ?? '').trim();
+        if (!raw) {
+            return { remote: fallbackRemote, branch: '', key: '' };
+        }
+        const slash = raw.indexOf('/');
+        if (slash > 0) {
+            const remote = raw.slice(0, slash);
+            const branch = raw.slice(slash + 1);
+            return { remote, branch, key: `${remote}/${branch}` };
+        }
+        return {
+            remote: fallbackRemote,
+            branch: raw,
+            key: fallbackRemote ? `${fallbackRemote}/${raw}` : raw
+        };
+    }
+
+    buildRemoteBranchIndex(branchSummary) {
+        const index = new Map();
+        for (const refName of branchSummary.all) {
+            if (!refName?.startsWith('remotes/')) continue;
+            const match = refName.match(/^remotes\/([^/]+)\/(.+)$/);
+            if (!match) continue;
+            const remote = match[1];
+            const branch = this.normalizeRemoteBranchName(refName);
+            if (!branch) continue;
+            const lower = branch.toLowerCase();
+            if (!index.has(lower)) index.set(lower, []);
+            const list = index.get(lower);
+            if (!list.some((item) => item.remote === remote && item.branch === branch)) {
+                list.push({ remote, branch });
+            }
+        }
+        return index;
+    }
+
+    findRemoteBranchMatch(index, branchName, remoteName = null) {
+        const trimmed = String(branchName ?? '').trim();
+        if (!trimmed) return null;
+        const lower = trimmed.toLowerCase();
+        const matches = (index.get(lower) ?? []).filter(
+            (item) => !remoteName || item.remote === remoteName
+        );
+        return matches.length === 1 ? matches[0] : null;
+    }
+
     async fetchAll(git) {
         await git.fetch(['--all', '--prune']);
     }
@@ -185,6 +265,314 @@ class GitService extends EventEmitter {
         return { branches: unique, current, fetchWarnings: warnings };
     }
 
+    async getBranchGroups(repoIndex = 1) {
+        const git = this.getGitByRepoIndex(repoIndex);
+        const { warnings } = await this.safeFetch(git);
+        const remotes = await this.getRemotes(repoIndex);
+        const branchSummary = await git.branch(['-a']);
+        const branchToRemotes = new Map();
+
+        const groups = remotes.map(({ name }) => {
+            const branches = branchSummary.all
+                .filter((ref) => this.matchesRemoteRef(ref, name))
+                .map((ref) => this.normalizeRemoteBranchName(ref))
+                .filter(Boolean);
+            const unique = Array.from(new Set(branches)).sort();
+            for (const branch of unique) {
+                const lower = branch.toLowerCase();
+                if (!branchToRemotes.has(lower)) {
+                    branchToRemotes.set(lower, { branch, remotes: [] });
+                }
+                branchToRemotes.get(lower).remotes.push(name);
+            }
+            return { remote: name, branches: unique };
+        });
+
+        const duplicates = [...branchToRemotes.values()]
+            .filter(
+                (item) => item.remotes.length > 1 && !this.isIgnoredDuplicateBranch(item.branch)
+            )
+            .map((item) => item.branch)
+            .sort();
+
+        return {
+            groups,
+            duplicates,
+            current: branchSummary.current,
+            fetchWarnings: warnings
+        };
+    }
+
+    normalizeBranchFamilyName(name) {
+        return String(name || '').trim().toLowerCase();
+    }
+
+    isVariantOfBranch(baseName, candidateName) {
+        const base = this.normalizeBranchFamilyName(baseName);
+        const candidate = this.normalizeBranchFamilyName(candidateName);
+        if (!base || !candidate) return false;
+        if (candidate === base) return true;
+        if (!candidate.startsWith(base)) return false;
+        const suffix = candidate.slice(base.length);
+        return /^[0-9]+$/.test(suffix);
+    }
+
+    collectBranchFamilyCandidates(index, target) {
+        const candidates = [];
+        const seen = new Set();
+
+        for (const list of index.values()) {
+            for (const item of list) {
+                if (!this.isVariantOfBranch(target, item.branch)) continue;
+                const dedupeKey = `${item.remote}/${item.branch}`.toLowerCase();
+                if (seen.has(dedupeKey)) continue;
+                seen.add(dedupeKey);
+                candidates.push(item);
+            }
+        }
+
+        return candidates;
+    }
+
+    async resolveBestRemoteBranches(branchNames, repoIndex = 1) {
+        const git = this.getGitByRepoIndex(repoIndex);
+        if (!Array.isArray(branchNames) || branchNames.length === 0) {
+            return { resolved: [], unresolved: [] };
+        }
+
+        await this.safeFetch(git);
+        const branchSummary = await git.branch(['-a']);
+        const index = this.buildRemoteBranchIndex(branchSummary);
+        const timestampCache = new Map();
+
+        const getTimestamp = async (remote, branch) => {
+            const key = `${remote}/${branch}`;
+            if (timestampCache.has(key)) return timestampCache.get(key);
+            const ts = await this.getRemoteBranchLastCommitTime(git, remote, branch);
+            timestampCache.set(key, ts);
+            return ts;
+        };
+
+        const resolved = [];
+        const unresolved = [];
+
+        for (const rawName of branchNames) {
+            const target = String(rawName || '').trim();
+            if (!target) continue;
+
+            const candidates = this.collectBranchFamilyCandidates(index, target);
+            const matchMode = candidates.some(
+                (item) => this.normalizeBranchFamilyName(item.branch) === target.toLowerCase()
+            )
+                ? 'exact'
+                : 'variant';
+
+            if (!candidates.length) {
+                unresolved.push({ input: target, reason: 'not-found' });
+                continue;
+            }
+
+            const ranked = await Promise.all(
+                candidates.map(async (item) => ({
+                    remote: item.remote,
+                    branch: item.branch,
+                    key: this.formatRemoteBranchKey(item.remote, item.branch),
+                    lastCommitAt: await getTimestamp(item.remote, item.branch)
+                }))
+            );
+            ranked.sort((a, b) => b.lastCommitAt - a.lastCommitAt);
+
+            resolved.push({
+                input: target,
+                mode: matchMode,
+                best: ranked[0],
+                candidates: ranked
+            });
+        }
+
+        return { resolved, unresolved };
+    }
+
+    async getRemoteBranchLastCommitTime(git, remoteName, branchName) {
+        try {
+            const output = await git.raw([
+                'log',
+                '-1',
+                '--format=%ct',
+                `${remoteName}/${branchName}`
+            ]);
+            const timestamp = Number.parseInt(String(output).trim(), 10);
+            return Number.isFinite(timestamp) ? timestamp : 0;
+        } catch {
+            return 0;
+        }
+    }
+
+    async planStaleDuplicateDeletions(repoIndex = 1) {
+        const git = this.getGitByRepoIndex(repoIndex);
+        const { warnings } = await this.safeFetch(git);
+        const branchSummary = await git.branch(['-a']);
+        const index = this.buildRemoteBranchIndex(branchSummary);
+        const deletions = [];
+
+        for (const matches of index.values()) {
+            if (matches.length < 2) continue;
+            if (this.isIgnoredDuplicateBranch(matches[0].branch)) continue;
+
+            const ranked = await Promise.all(
+                matches.map(async (match) => {
+                    const lastCommitAt = await this.getRemoteBranchLastCommitTime(
+                        git,
+                        match.remote,
+                        match.branch
+                    );
+                    return {
+                        branch: match.branch,
+                        remote: match.remote,
+                        key: this.formatRemoteBranchKey(match.remote, match.branch),
+                        lastCommitAt
+                    };
+                })
+            );
+
+            ranked.sort((a, b) => a.lastCommitAt - b.lastCommitAt);
+            const stalest = ranked[0];
+            const newest = ranked[ranked.length - 1];
+            if (!stalest) continue;
+
+            deletions.push({
+                branch: stalest.branch,
+                remote: stalest.remote,
+                key: stalest.key,
+                lastCommitAt: stalest.lastCommitAt,
+                keepRemote: newest.remote,
+                keepKey: newest.key,
+                keepLastCommitAt: newest.lastCommitAt
+            });
+        }
+
+        deletions.sort((a, b) => a.branch.localeCompare(b.branch));
+        return { deletions, fetchWarnings: warnings };
+    }
+
+    async deleteStaleDuplicateRemoteBranches(repoIndex = 1, onLog) {
+        const git = this.getGitByRepoIndex(repoIndex);
+        const state = this.syncState[repoIndex];
+
+        if (state.isSyncing) {
+            throw new Error(`仓库${repoIndex} 已有任务正在执行`);
+        }
+
+        state.cancelRequested = false;
+        state.isSyncing = true;
+
+        const log = (message, level = 'info') => {
+            const payload = {
+                message: `[仓库${repoIndex}] ${message}`,
+                level,
+                timestamp: new Date().toISOString(),
+                repoIndex
+            };
+            if (typeof onLog === 'function') {
+                onLog(payload);
+            } else {
+                this.emit('log', payload);
+            }
+        };
+
+        const formatCommitTime = (timestamp) => {
+            if (!timestamp) return '未知时间';
+            return new Date(timestamp * 1000).toLocaleString('zh-CN');
+        };
+
+        const CANCEL_CODE = 'USER_CANCELLED';
+        const checkCancelled = () => {
+            if (state.cancelRequested) {
+                const cancelError = new Error('USER_CANCELLED');
+                cancelError.code = CANCEL_CODE;
+                throw cancelError;
+            }
+        };
+
+        const deleted = [];
+        const failed = [];
+        let cancelled = false;
+
+        try {
+            checkCancelled();
+            log('开始清理重名远程分支…');
+
+            const { deletions, fetchWarnings } = await this.planStaleDuplicateDeletions(repoIndex);
+            if (fetchWarnings?.length) {
+                fetchWarnings.forEach((warning) => log(warning, 'warn'));
+            }
+
+            if (!deletions.length) {
+                log('没有可清理的重名旧分支');
+                return { deleted, failed, cancelled };
+            }
+
+            const duplicateNames = [...new Set(deletions.map((item) => item.branch))];
+            log(
+                `警告：分支名 ${duplicateNames.join('、')} 在多个远程仓库中重复，请勾选时认准远程分组，或批量粘贴时使用 远程/分支 格式。`,
+                'warn'
+            );
+
+            log(
+                `共 ${deletions.length} 个重名旧分支待删除：\n${deletions
+                    .map(
+                        (item) =>
+                            `  ${item.key}（${formatCommitTime(item.lastCommitAt)}）→ 保留 ${item.keepKey}`
+                    )
+                    .join('\n')}`
+            );
+
+            log(`正在批量删除 ${deletions.length} 个重名旧分支…`);
+            for (const item of deletions) {
+                try {
+                    checkCancelled();
+                    await git.raw(['push', item.remote, '--delete', item.branch]);
+                    deleted.push(item);
+                } catch (error) {
+                    if (error?.code === CANCEL_CODE) {
+                        throw error;
+                    }
+                    const errMsg = error?.message ?? String(error);
+                    failed.push({ ...item, error: errMsg });
+                }
+            }
+
+            if (deleted.length) {
+                await this.safeFetch(git);
+                log(`批量删除完成，成功 ${deleted.length} 个：\n${deleted.map((item) => item.key).join('\n')}`);
+            }
+            if (failed.length) {
+                log(
+                    `批量删除失败 ${failed.length} 个：\n${failed.map((item) => `${item.key}: ${item.error}`).join('\n')}`,
+                    'error'
+                );
+            }
+            if (!failed.length && deleted.length) {
+                log(`清理完成，共删除 ${deleted.length} 个重名旧远程分支`);
+            }
+
+            return { deleted, failed, cancelled };
+        } catch (error) {
+            if (error?.code === CANCEL_CODE) {
+                cancelled = true;
+                log('清理任务已被用户中止', 'warn');
+                if (deleted.length) {
+                    log(`中止前已删除 ${deleted.length} 个：\n${deleted.map((item) => item.key).join('\n')}`);
+                }
+                return { deleted, failed, cancelled };
+            }
+            throw error;
+        } finally {
+            state.isSyncing = false;
+            state.cancelRequested = false;
+        }
+    }
+
     /**
      * 检查指定的分支名是否在远程仓库中存在
      * @param {string[]} branchNames - 要检查的分支名数组
@@ -192,52 +580,56 @@ class GitService extends EventEmitter {
      */
     async checkRemoteBranches(branchNames, repoIndex = 1, remoteName = null) {
         const git = this.getGitByRepoIndex(repoIndex);
-        if (!Array.isArray(branchNames) || branchNames.length === 0) {
-            return { exists: [], notExists: [] };
+        const normalizedNames = this.splitBranchNameInput(branchNames);
+        if (!normalizedNames.length) {
+            return { exists: [], notExists: [], ambiguous: [] };
         }
 
         await this.safeFetch(git);
         const branchSummary = await git.branch(['-a']);
+        const index = this.buildRemoteBranchIndex(branchSummary);
 
-        const remoteBranchSet = new Set();
-        const remoteBranchMap = new Map();
-        branchSummary.all
-            .filter((name) => this.matchesRemoteRef(name, remoteName))
-            .forEach((name) => {
-                const normalized = this.normalizeRemoteBranchName(name);
-                if (!normalized) return;
-                remoteBranchSet.add(normalized);
-                const lower = normalized.toLowerCase();
-                if (!remoteBranchMap.has(lower)) {
-                    remoteBranchMap.set(lower, normalized);
-                }
-            });
-
-        // 分类分支名
         const exists = [];
         const notExists = [];
+        const ambiguous = [];
 
-        branchNames.forEach((branchName) => {
+        normalizedNames.forEach((branchName) => {
             const trimmed = branchName.trim();
             if (!trimmed) return;
 
-            // 先尝试大小写完全匹配
-            if (remoteBranchSet.has(trimmed)) {
-                exists.push(trimmed);
-                return;
+            if (trimmed.includes('/')) {
+                const parsed = this.parseSyncTarget(trimmed);
+                if (parsed.remote && parsed.branch) {
+                    const match = this.findRemoteBranchMatch(index, parsed.branch, parsed.remote);
+                    if (match) {
+                        exists.push(this.formatRemoteBranchKey(match.remote, match.branch));
+                    } else {
+                        notExists.push(trimmed);
+                    }
+                    return;
+                }
             }
 
-            // 再尝试忽略大小写匹配
             const lower = trimmed.toLowerCase();
-            const realName = remoteBranchMap.get(lower);
-            if (realName) {
-                exists.push(realName);
-            } else {
+            let matches = index.get(lower) ?? [];
+            if (remoteName) {
+                matches = matches.filter((item) => item.remote === remoteName);
+            }
+
+            if (matches.length === 0) {
                 notExists.push(trimmed);
+            } else if (matches.length === 1) {
+                exists.push(this.formatRemoteBranchKey(matches[0].remote, matches[0].branch));
+            } else if (!this.isIgnoredDuplicateBranch(trimmed)) {
+                ambiguous.push({
+                    name: trimmed,
+                    remotes: matches.map((item) => item.remote),
+                    keys: matches.map((item) => this.formatRemoteBranchKey(item.remote, item.branch))
+                });
             }
         });
 
-        return { exists, notExists };
+        return { exists, notExists, ambiguous };
     }
 
     /**
@@ -320,7 +712,7 @@ class GitService extends EventEmitter {
         if (!state.cancelRequested) {
             state.cancelRequested = true;
             this.emit('log', {
-                message: `仓库${repoIndex} 收到中止请求，正在尝试停止当前同步任务`,
+                message: `仓库${repoIndex} 收到中止请求，正在尝试停止当前任务`,
                 level: 'warn',
                 timestamp: new Date().toISOString(),
                 repoIndex
@@ -329,13 +721,14 @@ class GitService extends EventEmitter {
         return true;
     }
 
-    async syncBranches(options = {}, onLog, repoIndex = 1) {
+    async syncBranches(options = {}, onLog, repoIndex = 1, onProgress) {
         const git = this.getGitByRepoIndex(repoIndex);
         const state = this.syncState[repoIndex];
 
         const {
             targetBranches,
             commitHash,
+            commitHashes = {},
             remoteName: selectedRemote
         } = options;
 
@@ -343,9 +736,14 @@ class GitService extends EventEmitter {
             throw new Error('至少选择一个目标分支');
         }
 
-        if (!commitHash) {
-            throw new Error('请填写需要同步的提交哈希');
-        }
+        const resolveCommitHashForRemote = (remoteName) => {
+            const remote = String(remoteName || '').trim();
+            if (!remote) return '';
+            const fromMap = commitHashes?.[remote];
+            if (fromMap) return String(fromMap).trim();
+            if (commitHash) return String(commitHash).trim();
+            return '';
+        };
 
         if (state.isSyncing) {
             throw new Error(`仓库${repoIndex} 已有同步任务正在执行`);
@@ -378,6 +776,17 @@ class GitService extends EventEmitter {
 
             const results = [];
             let cancelled = false;
+            const totalTargets = targetBranches.length;
+            const reportProgress = (current, branch = '') => {
+                if (typeof onProgress !== 'function') return;
+                onProgress({
+                    current,
+                    total: totalTargets,
+                    branch,
+                    repoIndex
+                });
+            };
+            const progressTag = (current) => `[${current}/${totalTargets}]`;
             const CANCEL_CODE = 'USER_CANCELLED';
             const checkCancelled = () => {
                 if (state.cancelRequested) {
@@ -396,10 +805,10 @@ class GitService extends EventEmitter {
             log('git fetch --all 完成');
 
             const branchSummary = await git.branch(['-a']);
-            const resolveRemoteRef = (branchName) => {
+            const resolveRemoteRef = (branchName, targetRemote) => {
                 const trimmed = branchName.trim();
                 for (const name of branchSummary.all) {
-                    if (!this.matchesRemoteRef(name, selectedRemote)) continue;
+                    if (!this.matchesRemoteRef(name, targetRemote)) continue;
                     const normalized = this.normalizeRemoteBranchName(name);
                     if (normalized === trimmed) {
                         return name;
@@ -408,70 +817,73 @@ class GitService extends EventEmitter {
                 return null;
             };
 
-            for (const target of targetBranches) {
-                const result = { branch: target, success: true, error: null };
+            for (let index = 0; index < targetBranches.length; index += 1) {
+                const target = targetBranches[index];
+                const parsed = this.parseSyncTarget(target, selectedRemote);
+                const { remote: targetRemote, branch: branchName, key: targetKey } = parsed;
+                if (!targetRemote || !branchName) {
+                    throw new Error(`无效的目标分支：${target}`);
+                }
+
+                const currentIndex = index + 1;
+                const result = { branch: targetKey, success: true, error: null };
                 let cherryPickStarted = false;
-                let remoteName = selectedRemote;
+                let remoteName = targetRemote;
+                const commitHashForRemote = resolveCommitHashForRemote(targetRemote);
+                const logTag = `${progressTag(currentIndex)} ${targetKey}`;
                 try {
                     checkCancelled();
-                    log(`开始同步到分支 ${target}（精准提交）`);
+                    if (!commitHashForRemote) {
+                        throw new Error(`远程 ${targetRemote} 未配置提交哈希`);
+                    }
+                    reportProgress(currentIndex, targetKey);
+                    log(`${progressTag(currentIndex)} 开始同步到 ${targetKey}（提交 ${commitHashForRemote}）`);
 
-                    let checkedOut = false;
-
-                    const remoteRef = resolveRemoteRef(target);
+                    const remoteRef = resolveRemoteRef(branchName, targetRemote);
                     if (!remoteRef) {
-                        const remoteHint = selectedRemote ? `远程 ${selectedRemote}` : '远程仓库';
                         throw new Error(
-                            `分支 ${target} 在${remoteHint}中不存在，无法进行同步。请确认远程仓库选择是否正确。`
+                            `分支 ${branchName} 在远程 ${targetRemote} 中不存在，无法进行同步。`
                         );
                     }
 
-                    // 提取远程仓库名称和分支引用
-                    // remoteRef 格式: remotes/origin/branch 或 remotes/upstream/branch
                     const remoteMatch = remoteRef.match(/^remotes\/([^/]+)\/(.+)$/);
                     if (!remoteMatch) {
                         throw new Error(`无法解析远程分支引用：${remoteRef}`);
                     }
                     remoteName = remoteMatch[1];
                     const remoteBranchName = remoteMatch[2];
-                    const remoteBranchRef = `${remoteName}/${remoteBranchName}`; // origin/branch 格式
+                    const remoteBranchRef = `${remoteName}/${remoteBranchName}`;
 
-                    if (!branchLocal.all.includes(target)) {
-                        // 本地分支不存在，从远程分支创建并跟踪
+                    if (!branchLocal.all.includes(branchName)) {
                         try {
-                            await git.checkout(['-b', target, remoteBranchRef]);
-                            log(`[${target}] 本地不存在，已从 ${remoteBranchRef} 创建并切换`);
-                            branchLocal.all.push(target);
-                            branchesCreatedDuringSync.add(target);
-                            checkedOut = true;
+                            await git.checkout(['-b', branchName, remoteBranchRef]);
+                            log(`[${logTag}] 本地不存在，已从 ${remoteBranchRef} 创建并切换`);
+                            branchLocal.all.push(branchName);
+                            branchesCreatedDuringSync.add(branchName);
                         } catch (createError) {
                             throw new Error(
                                 `创建或跟踪远端分支失败：${createError?.message ?? createError}`
                             );
                         }
                     } else {
-                        // 本地分支已存在，切换到该分支
-                        await git.checkout(target);
-                        log(`[${target}] 已切换到本地分支`);
-                        checkedOut = true;
+                        await git.checkout(branchName);
+                        log(`[${logTag}] 已切换到本地分支 ${branchName}`);
                     }
 
                     checkCancelled();
 
-                    // 拉取远程分支最新代码（确保与远程完全同步）
                     try {
-                        await git.pull(remoteName, target, { '--ff-only': null });
-                        log(`[${target}] 已拉取远程分支 ${remoteBranchRef} 最新代码`);
+                        await git.pull(remoteName, branchName, { '--ff-only': null });
+                        log(`[${logTag}] 已拉取远程分支 ${remoteBranchRef} 最新代码`);
                     } catch (pullError) {
-                        // 如果拉取失败（可能是本地有未提交的更改或无法快进），重置到远程分支状态
                         if (
                             pullError?.message?.includes('Not possible to fast-forward') ||
                             pullError?.message?.includes('Cannot pull with rebase')
                         ) {
-                            log(`[${target}] 无法快进合并，重置到远程分支状态`, 'warn');
+                            log(`[${logTag}] 无法快进合并，重置到远程分支状态`, 'warn');
                             try {
                                 await git.reset(['--hard', remoteBranchRef]);
-                                log(`[${target}] 已重置到远程分支 ${remoteBranchRef} 的最新状态`);
+                                log(`[${logTag}] 已重置到远程分支 ${remoteBranchRef} 的最新状态`);
                             } catch (resetError) {
                                 throw new Error(
                                     `同步远程分支失败：${resetError?.message ?? resetError}`
@@ -486,15 +898,14 @@ class GitService extends EventEmitter {
 
                     checkCancelled();
 
-                    // 推送分支到远程（远程分支已存在，直接推送）
                     const pushBranch = async () => {
-                        await git.push(remoteName, target);
-                        log(`[${target}] 已推送到 ${remoteBranchRef}`);
+                        await git.push(remoteName, branchName);
+                        log(`[${logTag}] 已推送到 ${remoteBranchRef}`);
                     };
 
                     cherryPickStarted = true;
-                    await git.raw(['cherry-pick', commitHash]);
-                    log(`[${target}] 已应用提交 ${commitHash}`);
+                    await git.raw(['cherry-pick', commitHashForRemote]);
+                    log(`[${logTag}] 已应用提交 ${commitHashForRemote}`);
                     await pushBranch();
                     checkCancelled();
                 } catch (error) {
@@ -502,41 +913,37 @@ class GitService extends EventEmitter {
                         cancelled = true;
                         result.success = false;
                         result.error = '用户已中止';
-                        log(`[${target}] 同步已被中止`, 'warn');
+                        log(`[${logTag}] 同步已被中止`, 'warn');
                     } else {
                         const rawMessage = error?.message ?? String(error);
                         
-                        // 检测 cherry-pick 空提交的情况（代码已经和需要同步的一样了）
                         if (rawMessage.includes('cherry-pick is now empty') || 
                             rawMessage.includes('nothing to commit') && rawMessage.includes('cherry-pick')) {
-                            // 执行 cherry-pick --skip 跳过空提交
                             try {
                                 await git.raw(['cherry-pick', '--skip']);
-                                log(`[${target}] 该分支已包含相同的更改，无需重复同步（已自动跳过）`, 'info');
+                                log(`[${logTag}] 该分支已包含相同的更改，无需重复同步（已自动跳过）`, 'info');
                                 result.success = true;
                                 result.error = null;
                             } catch (skipError) {
-                                log(`[${target}] 跳过空提交失败: ${skipError?.message ?? skipError}`, 'warn');
-                                result.success = true; // 仍然标记为成功，因为代码已经一致
+                                log(`[${logTag}] 跳过空提交失败: ${skipError?.message ?? skipError}`, 'warn');
+                                result.success = true;
                                 result.error = null;
                             }
                         }
-                        // 检测网络超时错误，自动重试
                         else if (rawMessage.includes('Connection timed out') || 
                                  rawMessage.includes('Could not read from remote repository') ||
                                  rawMessage.includes('Connection refused') ||
                                  rawMessage.includes('Network is unreachable')) {
-                            log(`[${target}] 网络连接超时，正在重试...`, 'warn');
+                            log(`[${logTag}] 网络连接超时，正在重试...`, 'warn');
                             
-                            // 尝试重试一次
                             let retrySuccess = false;
                             for (let retryCount = 1; retryCount <= 2; retryCount++) {
                                 try {
                                     checkCancelled();
-                                    log(`[${target}] 第 ${retryCount} 次重试推送...`, 'info');
-                                    await new Promise(resolve => setTimeout(resolve, 2000)); // 等待2秒后重试
-                                    await git.push(remoteName, target);
-                                    log(`[${target}] 重试推送成功！`, 'info');
+                                    log(`[${logTag}] 第 ${retryCount} 次重试推送...`, 'info');
+                                    await new Promise(resolve => setTimeout(resolve, 2000));
+                                    await git.push(remoteName, branchName);
+                                    log(`[${logTag}] 重试推送成功！`, 'info');
                                     retrySuccess = true;
                                     break;
                                 } catch (retryError) {
@@ -545,9 +952,9 @@ class GitService extends EventEmitter {
                                         retryMsg.includes('Could not read from remote repository') ||
                                         retryMsg.includes('Connection refused') ||
                                         retryMsg.includes('Network is unreachable')) {
-                                        log(`[${target}] 第 ${retryCount} 次重试失败，网络仍不可用`, 'warn');
+                                        log(`[${logTag}] 第 ${retryCount} 次重试失败，网络仍不可用`, 'warn');
                                     } else {
-                                        log(`[${target}] 重试时发生其他错误: ${retryMsg}`, 'error');
+                                        log(`[${logTag}] 重试时发生其他错误: ${retryMsg}`, 'error');
                                         break;
                                     }
                                 }
@@ -559,18 +966,18 @@ class GitService extends EventEmitter {
                             } else {
                                 result.success = false;
                                 result.error = '网络连接失败，请检查网络后重试';
-                                log(`[${target}] 同步失败: 网络连接超时，多次重试后仍失败`, 'error');
+                                log(`[${logTag}] 同步失败: 网络连接超时，多次重试后仍失败`, 'error');
                             }
                         } else {
                             result.success = false;
                             result.error = rawMessage;
-                            log(`[${target}] 同步失败: ${result.error}`, 'error');
+                            log(`[${logTag}] 同步失败: ${result.error}`, 'error');
                             if (cherryPickStarted) {
                                 try {
                                     await git.raw(['cherry-pick', '--abort']);
-                                    log(`[${target}] 已回滚 cherry-pick 操作`, 'warn');
+                                    log(`[${logTag}] 已回滚 cherry-pick 操作`, 'warn');
                                 } catch (abortError) {
-                                    log(`[${target}] 回滚 cherry-pick 失败: ${abortError?.message ?? abortError}`, 'error');
+                                    log(`[${logTag}] 回滚 cherry-pick 失败: ${abortError?.message ?? abortError}`, 'error');
                                 }
                             }
                         }

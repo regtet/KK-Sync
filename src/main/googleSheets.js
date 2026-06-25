@@ -4,7 +4,7 @@ import http from 'http';
 import https from 'https';
 import { shell } from 'electron';
 
-const SCOPES = 'https://www.googleapis.com/auth/spreadsheets.readonly';
+const SCOPES = 'https://www.googleapis.com/auth/spreadsheets';
 export const DEFAULT_SPREADSHEET_ID = '1UPs8r7YsazA5Zeaox7I9YDaQY4U0nj4NSSL-K6nPrWs';
 export const DEFAULT_SHEET_GID = 0;
 const OAUTH_LOOPBACK_PORT = 47291;
@@ -248,6 +248,18 @@ async function sheetsRequest(accessToken, requestPath) {
   });
 }
 
+async function sheetsBatchUpdate(accessToken, spreadsheetId, payload) {
+  return httpsJson(
+    'POST',
+    `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`,
+    {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json; charset=utf-8',
+    },
+    JSON.stringify(payload)
+  );
+}
+
 async function resolveSheetTitle(spreadsheetId, sheetGid, accessToken) {
   const meta = await sheetsRequest(
     accessToken,
@@ -270,12 +282,23 @@ function encodeSheetRange(sheetTitle, rangeA1 = 'A1:H539') {
 
 function extractCellText(cell) {
   if (!cell) return '';
-  if (cell.formattedValue != null && cell.formattedValue !== '') {
-    return String(cell.formattedValue).trim();
-  }
+  const formattedText =
+    cell.formattedValue != null && cell.formattedValue !== ''
+      ? sanitizeBranchText(cell.formattedValue)
+      : '';
   const uv = cell.userEnteredValue;
+  const rawStringText = uv?.stringValue != null ? sanitizeBranchText(uv.stringValue) : '';
+
+  // 某些单元格 formattedValue 会出现 U+FFFD（�）乱码，优先回退到原始 stringValue
+  if (formattedText) {
+    if (formattedText.includes('\uFFFD') && rawStringText) {
+      return rawStringText;
+    }
+    return formattedText;
+  }
+
   if (!uv) return '';
-  if (uv.stringValue != null) return String(uv.stringValue).trim();
+  if (rawStringText) return rawStringText;
   if (uv.numberValue != null) return String(uv.numberValue).trim();
   if (uv.boolValue != null) return String(uv.boolValue).trim();
   return '';
@@ -319,28 +342,18 @@ async function fetchSheetRowEntries(spreadsheetId, sheetTitle, accessToken, rang
   return entries;
 }
 
-// B 备注/分支、C 项目名(备选分支)、H 所属系列
+// B 备注/分支、C 项目名(备选分支)、F 分区说明、H 所属系列
 const SHEET_COL = {
   B: 1,
   C: 2,
+  F: 5,
   H: 7,
 };
 
-const STOP_MARKER = '停止代理';
 const DEFAULT_STOP_ROW = 540;
-
-function normalizeMarkerText(text) {
-  return String(text || '')
-    .trim()
-    .replace(/\s+/g, '')
-    .replace(/　/g, '');
-}
-
-function isStopMarkerCell(text) {
-  const normalized = normalizeMarkerText(text);
-  if (!normalized) return false;
-  return normalized === STOP_MARKER || normalized.includes(STOP_MARKER);
-}
+const STOP_MARKER = '停止代理';
+/** 停止代理区首项：C 列「MOM777 + 合并服务器2」，该行及以下不读取 */
+const STOP_SECTION_PROJECT_C = 'mom777合并服务器2';
 
 // 分支名 token：1x-tz3、wg-peixe2、we-xxx 等
 const BRANCH_TOKEN_PATTERNS = [
@@ -353,19 +366,56 @@ function sheetCell(cells, index) {
   return String(cells?.[index] ?? '').trim();
 }
 
-function normalizeBranchName(name) {
-  return String(name || '').trim().toLowerCase();
+function sanitizeBranchText(text) {
+  return String(text || '')
+    .normalize('NFKC')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/[‐‑‒–—―－﹣]/g, '-')
+    .trim();
 }
 
 export function normalizeBranchNameFromC(name) {
-  return String(name || '')
+  return sanitizeBranchText(name)
     .trim()
-    .replace(/[\s\u3000]+/g, '')
+    .replace(/[\s\u3000\r\n]+/g, '')
     .toLowerCase();
 }
 
+function normalizeMarkerText(text) {
+  return String(text || '')
+    .trim()
+    .replace(/\s+/g, '')
+    .replace(/\u3000/g, '');
+}
+
+function cellContainsStopMarker(text) {
+  const normalized = normalizeMarkerText(text);
+  if (!normalized) return false;
+  return normalized.includes(STOP_MARKER);
+}
+
+/** F/A/B 列出现「停止代理」说明行（浏览器中折叠分组的标题行） */
+export function isStopSectionDividerRow(cells) {
+  const markerCols = [0, SHEET_COL.B, SHEET_COL.F];
+  for (const col of markerCols) {
+    if (cellContainsStopMarker(sheetCell(cells, col))) return true;
+  }
+  return false;
+}
+
+/** 停止代理区首行：C 列为 MOM777 / 合并服务器2（换行或空格均可） */
+export function isStopSectionStartRow(cells) {
+  const rawC = sheetCell(cells, SHEET_COL.C);
+  if (!rawC) return false;
+  return normalizeBranchNameFromC(rawC) === STOP_SECTION_PROJECT_C;
+}
+
+function isSheetStopBoundaryRow(cells) {
+  return isStopSectionDividerRow(cells) || isStopSectionStartRow(cells);
+}
+
 export function extractBranchFromB(text) {
-  const raw = String(text || '').trim();
+  const raw = sanitizeBranchText(text);
   if (!raw) return '';
 
   const matches = [];
@@ -387,6 +437,12 @@ export function extractBranchFromB(text) {
   return '';
 }
 
+function looksLikePlainBranchText(text) {
+  if (!text) return false;
+  // 仅允许英文数字/常见分支分隔符，避免把中文项目名整段当分支
+  return /^[a-z0-9][a-z0-9._/\-\s\u3000]*$/i.test(text);
+}
+
 export function resolveBranchName(cells) {
   const rawB = sheetCell(cells, SHEET_COL.B);
   const rawC = sheetCell(cells, SHEET_COL.C);
@@ -401,14 +457,27 @@ export function resolveBranchName(cells) {
     };
   }
 
-  const fromC = normalizeBranchNameFromC(rawC);
-  if (fromC) {
+  const fromCToken = extractBranchFromB(rawC);
+  if (fromCToken) {
     return {
-      branchName: fromC,
+      branchName: fromCToken,
       branchSource: 'C',
       branchRawB: rawB,
       branchRawC: rawC,
     };
+  }
+
+  const sanitizedC = sanitizeBranchText(rawC);
+  if (looksLikePlainBranchText(sanitizedC)) {
+    const fromC = normalizeBranchNameFromC(sanitizedC);
+    if (fromC) {
+      return {
+        branchName: fromC,
+        branchSource: 'C',
+        branchRawB: rawB,
+        branchRawC: rawC,
+      };
+    }
   }
 
   return null;
@@ -421,9 +490,7 @@ export function resolveStopRowNumber(entries) {
   for (const entry of entries) {
     if (entry.sheetRowNumber >= DEFAULT_STOP_ROW) break;
 
-    const rawB = sheetCell(entry.cells, SHEET_COL.B);
-    const rawA = sheetCell(entry.cells, 0);
-    if (isStopMarkerCell(rawB) || isStopMarkerCell(rawA)) {
+    if (isSheetStopBoundaryRow(entry.cells)) {
       stopRowNumber = Math.min(stopRowNumber, entry.sheetRowNumber);
       break;
     }
@@ -446,6 +513,12 @@ function buildRowPreview(branch) {
     parts.push(`C:${branch.branchRawC}`);
   }
   return parts.join(' | ');
+}
+
+function isDemoProjectRow(cells) {
+  const rawC = sheetCell(cells, SHEET_COL.C);
+  if (!rawC) return false;
+  return normalizeBranchNameFromC(rawC).includes('demo');
 }
 
 function groupRowsBySeries(rows) {
@@ -475,10 +548,9 @@ function parseSheetDataRows(entries, options = {}) {
 
     const { cells } = entry;
     if (!cells?.some((cell) => cell)) continue;
-    if (skipHeader && isSheetHeaderRow(cells)) continue;
-
-    const rawB = sheetCell(cells, SHEET_COL.B);
-    if (isStopMarkerCell(rawB)) continue;
+    // 仅前几行可能是表头，避免把正文里含“分支”等文字的行误判并跳过
+    if (skipHeader && entry.sheetRowNumber <= 3 && isSheetHeaderRow(cells)) continue;
+    if (isDemoProjectRow(cells)) continue;
 
     const branch = resolveBranchName(cells);
     if (!branch) continue;
@@ -526,5 +598,60 @@ export async function fetchSpreadsheetRows(userDataDir, searchDirs, options = {}
     groups,
     total: rows.length,
     groupCount: groups.length,
+  };
+}
+
+export async function writeSpreadsheetBranchNames(userDataDir, searchDirs, options = {}) {
+  const spreadsheetId = options.spreadsheetId || DEFAULT_SPREADSHEET_ID;
+  const sheetGid = options.sheetGid ?? DEFAULT_SHEET_GID;
+  const updates = Array.isArray(options.updates) ? options.updates : [];
+  if (!updates.length) {
+    return { ok: false, message: '没有可回填的数据' };
+  }
+
+  const accessToken = await getValidAccessToken(userDataDir, searchDirs);
+  const sheetTitle = await resolveSheetTitle(spreadsheetId, sheetGid, accessToken);
+  const requests = updates
+    .map((item) => {
+      const rowNumber = Number(item?.rowNumber);
+      const branchName = String(item?.branchName || '').trim();
+      if (!Number.isInteger(rowNumber) || rowNumber <= 0 || !branchName) return null;
+      return {
+        updateCells: {
+          range: {
+            sheetId: Number(sheetGid),
+            startRowIndex: rowNumber - 1,
+            endRowIndex: rowNumber,
+            startColumnIndex: SHEET_COL.B,
+            endColumnIndex: SHEET_COL.B + 1,
+          },
+          rows: [
+            {
+              values: [
+                {
+                  userEnteredValue: {
+                    stringValue: branchName,
+                  },
+                },
+              ],
+            },
+          ],
+          fields: 'userEnteredValue',
+        },
+      };
+    })
+    .filter(Boolean);
+
+  if (!requests.length) {
+    return { ok: false, message: '没有可回填的有效行' };
+  }
+
+  await sheetsBatchUpdate(accessToken, spreadsheetId, { requests });
+  return {
+    ok: true,
+    spreadsheetId,
+    sheetTitle,
+    sheetGid,
+    updated: requests.length,
   };
 }

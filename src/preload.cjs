@@ -14,9 +14,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getRepositoryInfo: (repoIndex = 1) => ipcRenderer.invoke('repo:info', repoIndex),
   listRemotes: (repoIndex = 1) => ipcRenderer.invoke('repo:list-remotes', repoIndex),
   listBranches: (repoIndex = 1, remoteName = null) =>
-    ipcRenderer.invoke('repo:list-branches', { repoIndex, remoteName }),
+    ipcRenderer.invoke('repo:list-branches', {
+      repoIndex,
+      remoteName,
+      allRemotes: !remoteName
+    }),
   checkRemoteBranches: (branchNames, repoIndex = 1, remoteName = null) =>
     ipcRenderer.invoke('repo:check-remote-branches', { branchNames, repoIndex, remoteName }),
+  planStaleDuplicateBranches: (repoIndex = 1) =>
+    ipcRenderer.invoke('repo:plan-stale-duplicates', repoIndex),
+  deleteStaleDuplicateBranches: (repoIndex = 1) =>
+    ipcRenderer.invoke('repo:delete-stale-duplicates', repoIndex),
   listStashes: (repoIndex = 1) => ipcRenderer.invoke('repo:list-stash', repoIndex),
   selectPatchFile: () => ipcRenderer.invoke('patch:select'),
   openExternal: (url) => ipcRenderer.invoke('app:open-external', url),
@@ -40,5 +48,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   googleSheetsAuthStatus: () => ipcRenderer.invoke('google-sheets-auth-status'),
   googleSheetsLogin: () => ipcRenderer.invoke('google-sheets-login'),
   googleSheetsLogout: () => ipcRenderer.invoke('google-sheets-logout'),
-  googleSheetsFetchRows: (options) => ipcRenderer.invoke('google-sheets-fetch-rows', options)
+  googleSheetsFetchRows: (options) => ipcRenderer.invoke('google-sheets-fetch-rows', options),
+  googleSheetsWriteBranches: (options) => ipcRenderer.invoke('google-sheets-write-branches', options),
+  resolveBestBranches: (branchNames, repoIndex = 1) =>
+    ipcRenderer.invoke('repo:resolve-best-branches', { branchNames, repoIndex })
 });

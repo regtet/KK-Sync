@@ -9,6 +9,7 @@ import {
   findOAuthClientSecretPath,
   getGoogleAuthStatus,
   loginWithGoogle,
+  writeSpreadsheetBranchNames,
 } from './googleSheets.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -53,6 +54,10 @@ const writeRepoSession = (repoIndex, session = {}) => {
         curr.session[String(repoIndex)] = {
             remote: session.remote ?? '',
             commitHash: session.commitHash ?? '',
+            commitHashes:
+                session.commitHashes && typeof session.commitHashes === 'object'
+                    ? session.commitHashes
+                    : {},
             targetBranches: Array.isArray(session.targetBranches) ? session.targetBranches : []
         };
         writeFileSync(repoPathStoreFile, JSON.stringify(curr, null, 2), 'utf-8');
@@ -68,6 +73,10 @@ const readRepoSession = (repoIndex) => {
     return {
         remote: session.remote ?? '',
         commitHash: session.commitHash ?? '',
+        commitHashes:
+            session.commitHashes && typeof session.commitHashes === 'object'
+                ? session.commitHashes
+                : {},
         targetBranches: Array.isArray(session.targetBranches) ? session.targetBranches : []
     };
 };
@@ -150,7 +159,6 @@ async function createWindow() {
     if (isDev) {
         const devServerUrl = process.env.VITE_DEV_SERVER_URL || 'http://localhost:5173';
         await mainWindow.loadURL(devServerUrl);
-        mainWindow.webContents.openDevTools({ mode: 'detach' });
     } else {
         const rendererIndex = path.join(__dirname, '../../dist/renderer/index.html');
         await mainWindow.loadFile(rendererIndex);
@@ -215,11 +223,6 @@ const relayLog = withLogRelay('sync:log');
 
 gitService.on('log', relayLog);
 
-const pickDefaultRemote = (remotes = []) => {
-    if (!Array.isArray(remotes) || remotes.length === 0) return null;
-    return remotes.find((remote) => remote.name === 'origin')?.name ?? remotes[0].name;
-};
-
 const restoreRepositoryByIndex = async (repoIndex = 1) => {
     const key = repoIndex === 2 ? 'repo2' : 'repo1';
     const repoPath = readLastRepoPaths()[key];
@@ -235,16 +238,12 @@ const restoreRepositoryByIndex = async (repoIndex = 1) => {
         : await gitService.setRepository(repoPath);
     const remotes = await gitService.getRemotes(repoIndex);
     const session = readRepoSession(repoIndex);
-    const defaultRemote = session?.remote && remotes.some((remote) => remote.name === session.remote)
-        ? session.remote
-        : pickDefaultRemote(remotes);
-    const branches = await gitService.getBranches(repoIndex, defaultRemote);
+    const branches = await gitService.getBranchGroups(repoIndex);
     return {
         ok: true,
         repo: info,
         remotes,
         branches,
-        defaultRemote,
         session
     };
 };
@@ -282,15 +281,13 @@ ipcMain.handle('repo:select', async () => {
     try {
         const info = await gitService.setRepository(repoPath);
         const remotes = await gitService.getRemotes(1);
-        const defaultRemote = pickDefaultRemote(remotes);
-        const branches = await gitService.getBranches(1, defaultRemote);
+        const branches = await gitService.getBranchGroups(1);
         writeLastRepoPath('repo1', repoPath);
         return {
             canceled: false,
             repo: info,
             branches,
-            remotes,
-            defaultRemote
+            remotes
         };
     } catch (error) {
         return {
@@ -315,15 +312,13 @@ ipcMain.handle('repo:select2', async () => {
     try {
         const info = await gitService.setRepository2(repoPath);
         const remotes = await gitService.getRemotes(2);
-        const defaultRemote = pickDefaultRemote(remotes);
-        const branches = await gitService.getBranches(2, defaultRemote);
+        const branches = await gitService.getBranchGroups(2);
         writeLastRepoPath('repo2', repoPath);
         return {
             canceled: false,
             repo: info,
             branches,
-            remotes,
-            defaultRemote
+            remotes
         };
     } catch (error) {
         return {
@@ -337,7 +332,7 @@ ipcMain.handle('repo:clear2', async () => {
     try {
         await gitService.setRepository2(null);
         writeLastRepoPath('repo2', '');
-        writeRepoSession(2, { remote: '', commitHash: '', targetBranches: [] });
+        writeRepoSession(2, { remote: '', commitHash: '', commitHashes: {}, targetBranches: [] });
         return { ok: true };
     } catch (error) {
         return { ok: false, error: error?.message ?? String(error) };
@@ -370,9 +365,13 @@ ipcMain.handle('repo:list-branches', async (_, payload) => {
     try {
         const repoIndex =
             typeof payload === 'number' ? payload : payload?.repoIndex ?? 1;
+        const allRemotes =
+            typeof payload === 'object' && payload ? payload.allRemotes === true : false;
         const remoteName =
             typeof payload === 'object' && payload ? payload.remoteName ?? null : null;
-        const branches = await gitService.getBranches(repoIndex, remoteName);
+        const branches = allRemotes || !remoteName
+            ? await gitService.getBranchGroups(repoIndex)
+            : await gitService.getBranches(repoIndex, remoteName);
         return { ok: true, data: branches };
     } catch (error) {
         return { ok: false, error: error?.message ?? String(error) };
@@ -407,6 +406,46 @@ ipcMain.handle('repo:check-remote-branches', async (_, payload) => {
         return { ok: true, data: result };
     } catch (error) {
         return { ok: false, error: error?.message ?? String(error) };
+    }
+});
+
+ipcMain.handle('repo:plan-stale-duplicates', async (_, repoIndex = 1) => {
+    try {
+        const data = await gitService.planStaleDuplicateDeletions(repoIndex);
+        return { ok: true, data };
+    } catch (error) {
+        return { ok: false, error: error?.message ?? String(error) };
+    }
+});
+
+ipcMain.handle('repo:delete-stale-duplicates', async (_, repoIndex = 1) => {
+    try {
+        withLogRelay('sync:status')({ status: 'running', mode: 'cleanup-duplicates', repoIndex });
+        const { deleted, failed, cancelled } = await gitService.deleteStaleDuplicateRemoteBranches(
+            repoIndex,
+            relayLog
+        );
+        const results = [
+            ...deleted.map((item) => ({ branch: item.key, success: true, error: null })),
+            ...failed.map((item) => ({ branch: item.key, success: false, error: item.error }))
+        ];
+        withLogRelay('sync:status')({
+            status: cancelled ? 'cancelled' : 'completed',
+            mode: 'cleanup-duplicates',
+            repoIndex,
+            results
+        });
+        return { ok: true, data: { deleted, failed, cancelled } };
+    } catch (error) {
+        const message = error?.message ?? String(error);
+        relayLog({ message, level: 'error', timestamp: new Date().toISOString(), repoIndex });
+        withLogRelay('sync:status')({
+            status: 'failed',
+            mode: 'cleanup-duplicates',
+            repoIndex,
+            message
+        });
+        return { ok: false, error: message };
     }
 });
 
@@ -457,8 +496,26 @@ ipcMain.handle('app:copy-text', async (_, text) => {
 ipcMain.handle('sync:start', async (_, payload) => {
     const { mode = 'commit', repoIndex = 1 } = payload ?? {};
     try {
-    withLogRelay('sync:status')({ status: 'running', mode, repoIndex });
-    const { results, cancelled } = await gitService.syncBranches(payload, relayLog, repoIndex);
+    withLogRelay('sync:status')({
+        status: 'running',
+        mode,
+        repoIndex,
+        total: Array.isArray(payload?.targetBranches) ? payload.targetBranches.length : 0
+    });
+    const onProgress = (progress) => {
+        withLogRelay('sync:status')({
+            status: 'progress',
+            mode,
+            repoIndex,
+            ...progress
+        });
+    };
+    const { results, cancelled } = await gitService.syncBranches(
+        payload,
+        relayLog,
+        repoIndex,
+        onProgress
+    );
     withLogRelay('sync:status')({
       status: cancelled ? 'cancelled' : 'completed',
       mode,
@@ -478,7 +535,7 @@ ipcMain.handle('sync:cancel', async (_, repoIndex = 1) => {
   try {
     const cancelled = gitService.cancelSync(repoIndex);
     if (!cancelled) {
-      return { ok: false, error: `仓库${repoIndex} 当前没有正在进行的同步任务` };
+      return { ok: false, error: `仓库${repoIndex} 当前没有正在进行的任务` };
     }
     return { ok: true };
   } catch (error) {
@@ -576,5 +633,29 @@ ipcMain.handle('google-sheets-fetch-rows', async (_event, options = {}) => {
     return result;
   } catch (e) {
     return { ok: false, message: e.message || '读取 Google 表格失败' };
+  }
+});
+
+ipcMain.handle('repo:resolve-best-branches', async (_event, payload = {}) => {
+  try {
+    const repoIndex = payload?.repoIndex ?? 1;
+    const branchNames = Array.isArray(payload?.branchNames) ? payload.branchNames : [];
+    const result = await gitService.resolveBestRemoteBranches(branchNames, repoIndex);
+    return { ok: true, data: result };
+  } catch (e) {
+    return { ok: false, message: e.message || '智能匹配分支失败' };
+  }
+});
+
+ipcMain.handle('google-sheets-write-branches', async (_event, options = {}) => {
+  try {
+    const result = await writeSpreadsheetBranchNames(
+      app.getPath('userData'),
+      getGoogleCredentialSearchDirs(),
+      options
+    );
+    return result;
+  } catch (e) {
+    return { ok: false, message: e.message || '回填 Google 表格失败' };
   }
 });
