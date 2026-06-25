@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import http from 'http';
 import https from 'https';
 import { shell } from 'electron';
@@ -7,8 +8,11 @@ import { shell } from 'electron';
 const SCOPES = 'https://www.googleapis.com/auth/spreadsheets';
 export const DEFAULT_SPREADSHEET_ID = '1UPs8r7YsazA5Zeaox7I9YDaQY4U0nj4NSSL-K6nPrWs';
 export const DEFAULT_SHEET_GID = 0;
-const OAUTH_LOOPBACK_PORT = 47291;
+const OAUTH_LOOPBACK_PORT = 47292;
 const OAUTH_REDIRECT_URI = `http://127.0.0.1:${OAUTH_LOOPBACK_PORT}/`;
+const SHARED_TOKEN_DIR_NAME = 'KK';
+const TOKEN_FILE_NAME = 'google-oauth-tokens.json';
+const SESSION_FILE_NAME = 'google-oauth-session.json';
 
 function httpsJson(method, requestUrl, headers = {}, body = null) {
   return new Promise((resolve, reject) => {
@@ -96,12 +100,50 @@ export function loadOAuthClientCredentials(searchDirs) {
   };
 }
 
-function getTokenStorePath(userDataDir) {
-  return path.join(userDataDir, 'google-oauth-tokens.json');
+function getSharedTokenDir() {
+  const base = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+  return path.join(base, SHARED_TOKEN_DIR_NAME);
 }
 
-export function loadStoredTokens(userDataDir) {
-  const tokenPath = getTokenStorePath(userDataDir);
+function getSharedTokenPath() {
+  return path.join(getSharedTokenDir(), TOKEN_FILE_NAME);
+}
+
+function getSessionPath(userDataDir) {
+  return path.join(userDataDir, SESSION_FILE_NAME);
+}
+
+function ensureSharedTokenDir() {
+  const dir = getSharedTokenDir();
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
+function isAppLoggedOut(userDataDir) {
+  const sessionPath = getSessionPath(userDataDir);
+  if (!fs.existsSync(sessionPath)) return false;
+  try {
+    return JSON.parse(fs.readFileSync(sessionPath, 'utf8'))?.loggedOut === true;
+  } catch {
+    return false;
+  }
+}
+
+function setAppLoggedOut(userDataDir, loggedOut) {
+  const sessionPath = getSessionPath(userDataDir);
+  if (loggedOut) {
+    fs.writeFileSync(
+      sessionPath,
+      JSON.stringify({ loggedOut: true, at: Date.now() }, null, 2),
+      'utf8'
+    );
+    return;
+  }
+  if (fs.existsSync(sessionPath)) fs.unlinkSync(sessionPath);
+}
+
+function readTokenFile(tokenPath) {
   if (!fs.existsSync(tokenPath)) return null;
   try {
     return JSON.parse(fs.readFileSync(tokenPath, 'utf8'));
@@ -110,14 +152,50 @@ export function loadStoredTokens(userDataDir) {
   }
 }
 
-function saveStoredTokens(userDataDir, tokens) {
-  const tokenPath = getTokenStorePath(userDataDir);
-  fs.writeFileSync(tokenPath, JSON.stringify(tokens, null, 2), 'utf8');
+function migrateLegacyTokens(userDataDir) {
+  const sharedPath = getSharedTokenPath();
+  if (fs.existsSync(sharedPath)) return;
+
+  const base = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+  const legacyPaths = [
+    path.join(userDataDir, TOKEN_FILE_NAME),
+    path.join(base, 'kk-skinlab', TOKEN_FILE_NAME),
+    path.join(base, 'kk-sync', TOKEN_FILE_NAME),
+  ];
+
+  let bestPath = '';
+  let bestScore = -1;
+
+  for (const legacyPath of legacyPaths) {
+    const tokens = readTokenFile(legacyPath);
+    if (!tokens?.refresh_token) continue;
+    const score = Number(tokens.expiry_date || 0);
+    if (score >= bestScore) {
+      bestScore = score;
+      bestPath = legacyPath;
+    }
+  }
+
+  if (!bestPath) return;
+
+  ensureSharedTokenDir();
+  fs.copyFileSync(bestPath, sharedPath);
+}
+
+export function loadStoredTokens(userDataDir) {
+  if (isAppLoggedOut(userDataDir)) return null;
+
+  migrateLegacyTokens(userDataDir);
+  return readTokenFile(getSharedTokenPath());
+}
+
+function saveStoredTokens(_userDataDir, tokens) {
+  ensureSharedTokenDir();
+  fs.writeFileSync(getSharedTokenPath(), JSON.stringify(tokens, null, 2), 'utf8');
 }
 
 export function clearStoredTokens(userDataDir) {
-  const tokenPath = getTokenStorePath(userDataDir);
-  if (fs.existsSync(tokenPath)) fs.unlinkSync(tokenPath);
+  setAppLoggedOut(userDataDir, true);
 }
 
 export function getGoogleAuthStatus(userDataDir) {
@@ -126,6 +204,7 @@ export function getGoogleAuthStatus(userDataDir) {
     authenticated: Boolean(tokens?.refresh_token || tokens?.access_token),
     hasRefreshToken: Boolean(tokens?.refresh_token),
     email: tokens?.email || '',
+    loggedOutLocally: isAppLoggedOut(userDataDir),
   };
 }
 
@@ -167,13 +246,19 @@ async function waitForOAuthCode() {
 
 export async function loginWithGoogle(userDataDir, searchDirs) {
   const creds = loadOAuthClientCredentials(searchDirs);
+  migrateLegacyTokens(userDataDir);
+  const existingTokens = readTokenFile(getSharedTokenPath());
+  setAppLoggedOut(userDataDir, false);
+
   const authUrl = new URL(creds.authUri);
   authUrl.searchParams.set('client_id', creds.clientId);
   authUrl.searchParams.set('redirect_uri', OAUTH_REDIRECT_URI);
   authUrl.searchParams.set('response_type', 'code');
   authUrl.searchParams.set('scope', SCOPES);
   authUrl.searchParams.set('access_type', 'offline');
-  authUrl.searchParams.set('prompt', 'consent');
+  if (!existingTokens?.refresh_token) {
+    authUrl.searchParams.set('prompt', 'consent');
+  }
   authUrl.searchParams.set('include_granted_scopes', 'true');
 
   const codePromise = waitForOAuthCode();
@@ -190,7 +275,7 @@ export async function loginWithGoogle(userDataDir, searchDirs) {
 
   const tokens = {
     access_token: tokenResponse.access_token,
-    refresh_token: tokenResponse.refresh_token || loadStoredTokens(userDataDir)?.refresh_token || '',
+    refresh_token: tokenResponse.refresh_token || existingTokens?.refresh_token || '',
     expiry_date: Date.now() + (tokenResponse.expires_in || 3600) * 1000,
     scope: tokenResponse.scope || SCOPES,
     token_type: tokenResponse.token_type || 'Bearer',

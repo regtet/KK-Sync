@@ -617,7 +617,7 @@ ipcMain.handle('google-sheets-login', async () => {
 ipcMain.handle('google-sheets-logout', async () => {
   try {
     clearStoredTokens(app.getPath('userData'));
-    return { ok: true, message: '已退出 Google 授权' };
+    return { ok: true, message: '已退出本工具的 Google 登录（不影响 KK SkinLab）' };
   } catch (e) {
     return { ok: false, message: e.message };
   }
